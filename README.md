@@ -53,7 +53,7 @@ source venv/bin/activate
 
 ### 2. Install Dependencies
 ```bash
-pip install paramiko
+pip3 install paramiko
 ```
 
 ## Usage
