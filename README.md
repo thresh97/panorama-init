@@ -49,3 +49,64 @@ It is highly recommended to run this within a Python Virtual Environment (`venv`
 ```bash
 python3 -m venv venv
 source venv/bin/activate
+<<<<<<< HEAD
+=======
+```
+
+### 2. Install Dependencies
+```bash
+pip install paramiko
+```
+
+## Usage
+
+You can provide the Panorama password securely via an environment variable if you are not using SSH keys:
+```bash
+export PANORAMA_PASSWORD='YourSecretPassword123!'
+```
+
+### Example Invocation
+
+```bash
+python3 panorama_provision.py \
+  --debug \
+  --username panadmin \
+  --serial-number 000000000000 \
+  --otp abcdef123456 \
+  --vm-auth-key \
+  --csp-api-key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --plugins sd_wan-3.3.3-h2,ztp-3.0.1,azure-5.2.3,aws-5.4.3,sw_fw_license-1.2.0 \
+  192.168.1.100
+```
+
+### Command Line Arguments
+
+* `ip`: (Required) The IP address of the Panorama VM.
+* `--username`: The SSH/API username (default: `admin`).
+* `--ssh-key`: Path to your SSH private key file (default: `~/.ssh/id_rsa`).
+* `--serial-number`: Serial number to apply to Panorama.
+* `--otp`: One-Time Password for fetching the device certificate.
+* `--csp-api-key`: Customer Support Portal API Key for licensing.
+* `--upgrade-content`: Flag to download and install the latest Content update.
+* `--upgrade-av`: Flag to download and install the latest Anti-Virus update.
+* `--plugins`: Comma-separated list of plugins to download and install.
+* `--vm-auth-key`: Generates a VM auth key. Optionally accepts a lifetime in hours (default: `8760`).
+* `--state-file`: Custom path for the state tracking JSON file.
+* `--debug`: Enables verbose logging, printing exact XML requests and responses.
+
+## Disclaimer
+
+**Lab & Demo Use Only:** This script is provided as-is for educational, lab, and demonstration purposes. It is not officially supported by Palo Alto Networks. Please review the code and test thoroughly in a non-production environment before utilizing it in any production capacity. The authors assume no responsibility for any misconfigurations or disruptions caused by the use of this tool.
+
+## License (MIT)
+
+MIT License
+
+Copyright (c) 2026
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+>>>>>>> 201713e (updated README.md)
