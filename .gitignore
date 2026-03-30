@@ -1,3 +1,4 @@
+*-state.json
 # Terraform
 # Ignore the .terraform directory, which contains downloaded provider binaries and plugin data.
 .terraform/
