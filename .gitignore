@@ -1,0 +1,55 @@
+# Terraform
+# Ignore the .terraform directory, which contains downloaded provider binaries and plugin data.
+.terraform/
+# Ignore the state file and its backups, as they may contain secrets and track infrastructure state.
+terraform.tfstate
+terraform.tfstate.backup
+# Ignore variable files that may contain environment-specific variables like API keys or passwords.
+*.tfvars
+*.tfvars.json
+# Ignore override files, usually used for local testing and not meant for version control.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# Ignore CLI configuration files.
+.terraformrc
+terraform.rc
+# Optional: ignore graph output files
+*.dot
+
+# Python
+# Byte-code files
+*.pyc
+__pycache__/
+# Environment files
+.venv/
+venv/
+env/
+# IDE-specific files (e.g., PyCharm, VS Code)
+.idea/
+.vscode/
+# Runtime files
+*.log
+*.swp
+# Installer logs
+pip-log.txt
+pip-delete-this-arg.txt
+# Unit test/coverage reports
+.coverage
+.tox/
+# Distribution / packaging
+dist/
+build/
+
+# Cloud
+# Generic cloud-related files that might contain sensitive data (adjust as needed)
+# It is recommended to use environment variables for secrets instead of files.
+*.pem # PEM files (e.g., SSH keys)
+*.key # Key files
+credentials
+.aws/
+.azure/
+.gcp/
+# Specific to Google Cloud (if using gcloud CLI)
+.gcloudignore # .gcloudignore has similar syntax but is used for cloud builds/deploys.
