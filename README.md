@@ -37,6 +37,7 @@ Similarly, utilizing the official `pan-os-python` SDK would normally be the most
 * **Active/Passive High Availability (HA):** Automated configuration of A/P HA peering between two provisioned Panorama nodes.
 * **Deployment Mode Configuration:** Ability to dynamically set or toggle the Panorama deployment mode between standard `panorama` mode (management + logging), `management-only` mode, and `log-collector` mode.
 * **Log Collector Setup (Panorama Mode):** Automated initialization of logging disks, creation of Collector Groups, and assignment of the local Log Collector when running in the default `panorama` mode.
+* **PAN-OS Upgrade:** Upgrade PAN-OS to target version.
 
 ## Prerequisites & Setup
 
