@@ -62,6 +62,8 @@ Firewalls bootstrapped under this model use `authkey=` in their bootstrap config
 **What the firewall bootstrap needs:**
 - `panorama-server=` Panorama IP
 - `panorama-server-2=` secondary Panorama IP (optional)
+- `tplname=` Panorama template stack name
+- `dgname=` Panorama device group name
 - `authkey=` generated via the sw_fw_license plugin
 - `plugin-op-commands=panorama-licensing-mode-on`
 
@@ -96,6 +98,8 @@ Authcodes can be delivered to the firewall in two ways:
 **What the firewall bootstrap needs:**
 - `panorama-server=` Panorama IP
 - `panorama-server-2=` secondary Panorama IP (optional)
+- `tplname=` Panorama template stack name
+- `dgname=` Panorama device group name
 - `vm-auth-key=` for Panorama registration
 - `authcodes=` (FW Flex deployment profile authcode) delivered via userdata or bootstrap package
 
