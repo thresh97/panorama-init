@@ -1,6 +1,8 @@
-# Panorama Virtual VM Initial Provisioning CLI
+# Panorama Initial Provisioning CLI
 
-A Python CLI tool designed to idempotently bootstrap and provision a Palo Alto Networks Panorama Virtual Machine.
+> **This script does not deploy Panorama.** It assumes Panorama is already running and reachable at the IP address you provide — fresh from factory defaults, with the admin account accessible via SSH.
+
+A Python CLI tool for idempotently bootstrapping and provisioning a freshly deployed, factory-default Palo Alto Networks Panorama instance. It works with any supported Panorama form factor: hardware appliances, software VMs on public cloud (Azure, AWS, GCP), and software VMs on private cloud or on-premises hypervisors.
 
 Due to the nature of Panorama deployments (long boot times, multiple management server restarts when applying licenses/certificates), traditional automation tools can sometimes struggle or falsely report failures. This script tracks its progress locally in a JSON state file. If a network timeout occurs or the Panorama web server restarts mid-flight, you can safely re-run the exact same command, and the script will pick up exactly where it left off.
 
@@ -69,6 +71,8 @@ Firewalls bootstrapped under this model use `authkey=` in their bootstrap config
 
 See [Panorama-Based Software Firewall License Management](https://docs.paloaltonetworks.com/vm-series/11-1/vm-series-deployment/license-the-vm-series-firewall/use-panorama-based-software-firewall-license-management) for full plugin configuration details.
 
+> **Note:** The `sw_fw_license` plugin (PAN-182488) does not support dedicated Log Collector groups (`cgname=` in bootstrap). It only works when Panorama is in `panorama` mode (combined management + logging). If your deployment uses separate Log Collectors, use Approach B instead.
+
 ```bash
 python3 panorama_init.py \
   --serial-number 000000000000 \
@@ -107,7 +111,6 @@ Authcodes can be delivered to the firewall in two ways:
 - **Licensing is one-shot**: The authcode is consumed on first successful contact with the PAN licensing cloud. If licensing fails for any reason, there is no automatic retry — manual intervention or redeployment is required.
 - **License deactivation**: Returning credits to the pool requires direct interaction with the [PANW Software NGFW Licensing API](https://docs.paloaltonetworks.com/vm-series/11-1/vm-series-deployment/license-the-vm-series-firewall/software-ngfw/software-ngfw-licensing-api). This is not handled by this script and requires custom orchestration. For autoscaling deployments this complexity should be weighed carefully against Approach A.
 
-> **Note:** There are known challenges when using Approach B with dedicated Log Collector groups. If your deployment uses separate Log Collectors, evaluate Approach A carefully before committing to this approach.
 
 ```bash
 python3 panorama_init.py \
@@ -129,7 +132,7 @@ python3 panorama_init.py \
 | Licensing transaction | Proxied through Panorama — no direct internet required from firewall mgmt | Firewall mgmt interface contacts PAN licensing cloud directly |
 | License deactivation | Configurable: automatic after 2–24 hours disconnection | Requires custom orchestration via PANW Software NGFW Licensing API |
 | Bootstrap failure recovery | Retries if pool depleted; Panorama manages retry | One-shot: failure requires manual intervention or redeployment |
-| Log Collector groups | Known challenges | Works well |
+| Log Collector groups | Not supported (PAN-182488); requires panorama-mode panorama | Works well |
 
 ---
 
@@ -152,11 +155,21 @@ pip install paramiko
 
 ### Authentication
 
-SSH key-based authentication is used by default (`~/.ssh/id_rsa`). To fall back to password authentication, set the environment variable:
+The script uses SSH for initial configuration (setting hostname, API password, and performing the first commit), then switches to the XML API for all subsequent steps. What you need depends on how your Panorama was deployed:
+
+**Public cloud (Azure, AWS, GCP):** Cloud marketplace images typically deploy with SSH key-based authentication and no local password set on the admin account. Use `--ssh-key` to point to your private key. No password is needed.
+
+```bash
+python3 panorama_init.py --ssh-key ~/.ssh/my-cloud-key.pem 192.168.1.100
+```
+
+**Private cloud / on-premises / hardware:** If Panorama already has a password configured on the admin account, provide it via environment variable:
 
 ```bash
 export PANORAMA_PASSWORD='YourSecretPassword123!'
 ```
+
+> **Known limitation — `admin/admin` default with forced password change:** Some deployments (hardware appliances and certain VM images) ship with a default `admin/admin` credential and require a password change on the very first interactive login before allowing any further access. This script does not currently handle that forced-change flow. If your Panorama requires this, you must complete the initial password change manually (via console or direct SSH) before running this script. See [Planned / Future Functionality](#planned--future-functionality).
 
 ### Command Line Arguments
 
@@ -247,6 +260,7 @@ The state file records: IP address, hostname, API password, serial number, conte
 
 ## Planned / Future Functionality
 
+- **Default credential / forced password change handling:** Automatically detect and handle the `admin/admin` default credential with forced password change on first login, common on hardware appliances and some VM images. This would allow the script to run fully unattended against a fresh out-of-box device with no prior manual steps.
 - **Active/Passive High Availability (HA):** Automated configuration of A/P HA peering between two provisioned Panorama nodes.
 - **Deployment Mode Configuration:** Ability to dynamically set or toggle the Panorama deployment mode between `panorama` mode (management + logging), `management-only` mode, and `log-collector` mode.
 - **Log Collector Setup:** Automated initialization of logging disks, creation of Collector Groups, and assignment of the local Log Collector when running in `panorama` mode.
