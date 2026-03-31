@@ -140,7 +140,7 @@ export PANORAMA_PASSWORD='YourSecretPassword123!'
 |---|---|---|
 | `ip` | *(required)* | IP address of the Panorama VM. Optional if `--state-file` is provided (IP is read from state). |
 | `--hostname` | `Panorama-Management` | Hostname to configure on the Panorama VM. |
-| `--username` | `admin` | SSH/API username. |
+| `--username` | *(from state, or `admin`)* | SSH/API username. Stored in state on first run; inferred automatically on re-runs. |
 | `--ssh-key` | `~/.ssh/id_rsa` | Path to SSH private key file. |
 | `--state-file` | `./panorama-<ip>-state.json` | Path to state tracking JSON file. If omitted, the current directory is scanned for an existing matching state file. |
 | `--serial-number` | — | Serial number to apply to Panorama via XML API. |
