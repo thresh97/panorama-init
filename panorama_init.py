@@ -233,10 +233,11 @@ def _send_op_job_command(ip, api_key, ctx, cmd_xml, timeout=30):
         raise RuntimeError(f"Invalid XML response: {raw_res}")
 
 
-def _is_already_latest(check_response: str, label: str) -> bool:
+def _is_already_latest(check_response: str, label: str):
     """
-    Parses a content/AV upgrade check response and returns True if the currently
-    installed version is already the latest available, making a download unnecessary.
+    Parses a content/AV upgrade check response.
+    Returns (True, version_str) if the installed version is already the latest,
+    or (False, "") if an update is available or the response could not be parsed.
     Looks for an entry where both <current>yes</current> and <latest>yes</latest>.
     """
     try:
@@ -247,10 +248,10 @@ def _is_already_latest(check_response: str, label: str) -> bool:
             if current == "yes" and latest == "yes":
                 version = entry.findtext("version", default="unknown")
                 LOGGER.info(f"✅ {label} is already at the latest version ({version}). Skipping download/install.")
-                return True
+                return True, version
     except ET.ParseError:
         LOGGER.debug(f"Could not parse {label} check response. Proceeding with update.")
-    return False
+    return False, ""
 
 
 def poll_panorama_job(ip, api_key, ctx, job_id, job_name, timeout_mins=20):
@@ -549,9 +550,15 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                        serial_number: str = None, otp: str = None, csp_api_key: str = None,
                        upgrade_content: bool = False, upgrade_av: bool = False,
                        upgrade_panos: str = None, plugins: str = None,
-                       vm_auth_key_hours: int = None):
+                       vm_auth_key_hours: int = None, hostname: str = None):
     """Executes the idempotent provisioning sequence on Panorama."""
     state = load_state(state_file)
+
+    # Persist the IP immediately so it can be recovered from the state file on re-runs.
+    if "ip" not in state:
+        state["ip"] = ip
+        save_state(state_file, state)
+
     ssh = PanoramaSSHClient(ip, username, ssh_key, password)
 
     try:
@@ -617,11 +624,12 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
 
             # Example Provisioning Step A: Set Hostname
             if not state.get("hostname_set"):
-                target_hostname = "Panorama-Management"
+                target_hostname = hostname or "Panorama-Management"
                 LOGGER.info(f"Setting hostname to '{target_hostname}'...")
                 ssh.send_command(f"set deviceconfig system hostname {target_hostname}", prompt_chars=['#'])
 
                 state["hostname_set"] = True
+                state["hostname"] = target_hostname
                 save_state(state_file, state)
                 LOGGER.info("✅ Hostname configured.")
             else:
@@ -917,7 +925,8 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 check_cmd = "<request><content><upgrade><check/></upgrade></content></request>"
                 check_response = _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
 
-                if not _is_already_latest(check_response, "Content"):
+                already_latest, version = _is_already_latest(check_response, "Content")
+                if not already_latest:
                     LOGGER.info("2/3 Downloading latest content update...")
                     dl_cmd = "<request><content><upgrade><download><latest/></download></upgrade></content></request>"
                     dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
@@ -928,7 +937,15 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
                     poll_panorama_job(ip, api_key, ctx, inst_job_id, "Content Install")
 
+                    # Confirm installed version from system info
+                    sysinfo_raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10)
+                    m = re.search(r'<app-version>([^<]+)</app-version>', sysinfo_raw)
+                    if m:
+                        version = m.group(1).strip()
+
                 state["content_upgraded"] = True
+                if version:
+                    state["content_version"] = version
                 save_state(state_file, state)
             except Exception as e:
                 LOGGER.error(f"Content upgrade failed: {e}")
@@ -945,7 +962,8 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 check_cmd = "<request><anti-virus><upgrade><check/></upgrade></anti-virus></request>"
                 check_response = _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
 
-                if not _is_already_latest(check_response, "Anti-Virus"):
+                already_latest, version = _is_already_latest(check_response, "Anti-Virus")
+                if not already_latest:
                     LOGGER.info("2/3 Downloading latest Anti-Virus update...")
                     dl_cmd = "<request><anti-virus><upgrade><download><latest/></download></upgrade></anti-virus></request>"
                     dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
@@ -956,7 +974,15 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
                     poll_panorama_job(ip, api_key, ctx, inst_job_id, "Anti-Virus Install")
 
+                    # Confirm installed version from system info
+                    sysinfo_raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10)
+                    m = re.search(r'<av-version>([^<]+)</av-version>', sysinfo_raw)
+                    if m:
+                        version = m.group(1).strip()
+
                 state["av_upgraded"] = True
+                if version:
+                    state["av_version"] = version
                 save_state(state_file, state)
             except Exception as e:
                 LOGGER.error(f"Anti-Virus upgrade failed: {e}")
@@ -1268,13 +1294,20 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
 
-    # Positional argument for IP
+    # Positional argument for IP — optional when --state-file is provided (IP is read from state).
     parser.add_argument(
         "ip",
-        help="The IP address of the Panorama VM to connect to."
+        nargs="?",
+        default=None,
+        help="The IP address of the Panorama VM to connect to. Optional if --state-file is provided."
     )
 
     # Optional arguments
+    parser.add_argument(
+        "--hostname",
+        default=None,
+        help="Hostname to set on the Panorama VM (default: Panorama-Management)."
+    )
     parser.add_argument(
         "--username",
         default="admin",
@@ -1374,14 +1407,30 @@ def main():
     # Resolve paths
     ssh_key_path = Path(args.ssh_key).expanduser().resolve()
 
+    # Resolve state file and IP.  IP may be omitted when --state-file is given explicitly,
+    # in which case we read it from the state file itself.
     if args.state_file:
         state_file_path = Path(args.state_file).expanduser().resolve()
+        if args.ip:
+            ip = args.ip
+        else:
+            stored = load_state(state_file_path)
+            ip = stored.get("ip")
+            if not ip:
+                parser.error(
+                    "No IP address found in the state file and none was provided. "
+                    "Please pass the IP as a positional argument."
+                )
+            LOGGER.info(f"Using IP '{ip}' from state file.")
     else:
-        state_file_path = _discover_state_file(args.ip)
+        if not args.ip:
+            parser.error("ip is required unless --state-file is provided.")
+        ip = args.ip
+        state_file_path = _discover_state_file(ip)
 
     try:
         provision_panorama(
-            ip=args.ip,
+            ip=ip,
             username=args.username,
             ssh_key=ssh_key_path,
             password=panorama_password,
@@ -1393,7 +1442,8 @@ def main():
             upgrade_av=args.upgrade_av,
             upgrade_panos=args.upgrade_panos,
             plugins=args.plugins,
-            vm_auth_key_hours=args.vm_auth_key_hours
+            vm_auth_key_hours=args.vm_auth_key_hours,
+            hostname=args.hostname,
         )
     except Exception as e:
         LOGGER.error(f"Provisioning failed: {e}", exc_info=True)
