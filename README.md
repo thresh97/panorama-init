@@ -102,7 +102,7 @@ python3 panorama_init.py \
 |---|---|---|
 | Firewall bootstrap key | `authkey=` (from sw_fw_license plugin) | `vm-auth-key=` (from `--vm-auth-key`) |
 | `--vm-auth-key` on this script | **Not used** | Required |
-| `--csp-api-key` | Required (license pool auth) | Optional (cert fetch only) |
+| `--csp-api-key` | Required (license pool auth) | Optional |
 | `sw_fw_license` plugin | Required | Not used |
 | Authcodes | Configured in Panorama, bound to Device Groups | In firewall userdata (`authcodes=`) or `/licenses/authcodes` |
 | Log Collector groups | Known challenges | Works well |
