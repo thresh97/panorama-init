@@ -565,11 +565,62 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
     if changed:
         save_state(state_file, state)
 
+    # --- API Pre-check ---
+    # If we already have a stored API password, attempt XML API authentication before
+    # opening an SSH session. A successful API call confirms:
+    #   1. The device is up and reachable
+    #   2. The stored password is still valid (admin_password_set)
+    # If the target hostname is also already set, the entire SSH phase can be skipped.
+    # If the API call fails (e.g. fresh device, mgmtsrvr not yet up), fall through to SSH.
+    api_key = None
+    ctx = None
+
+    if state.get("api_password") and not state.get("initial_commit_done"):
+        LOGGER.info("API password found in state. Attempting API pre-check before SSH...")
+        try:
+            _ctx = _make_ssl_ctx()
+            _keygen_data = urllib.parse.urlencode({
+                'type': 'keygen',
+                'user': username,
+                'password': state["api_password"]
+            }).encode('utf-8')
+            _req = urllib.request.Request(f"https://{ip}/api/", data=_keygen_data)
+            _res = urllib.request.urlopen(_req, context=_ctx, timeout=10)
+            _root = ET.fromstring(_res.read())
+            _key = _root.findtext(".//key")
+
+            if _key:
+                LOGGER.info("✅ API pre-check successful. Verifying device state...")
+                api_key = _key
+                ctx = _ctx
+                state["admin_password_set"] = True
+                state["system_ready"] = True
+
+                # Check whether the target hostname is already configured.
+                _sysinfo = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10)
+                _target_hostname = hostname or "Panorama-Management"
+                if f"<hostname>{_target_hostname}</hostname>" in _sysinfo:
+                    state["hostname_set"] = True
+                    state["hostname"] = _target_hostname
+                    LOGGER.info(f"✅ Hostname '{_target_hostname}' confirmed via API.")
+                    LOGGER.info("⏭️  All SSH phase steps confirmed via API. Skipping SSH entirely.")
+                    state["initial_commit_done"] = True
+                    save_state(state_file, state)
+                else:
+                    # Hostname not yet set — SSH still needed, but password step can be skipped.
+                    LOGGER.info("Hostname not yet configured. SSH required for config/commit.")
+                    save_state(state_file, state)
+        except Exception as _e:
+            LOGGER.debug(f"API pre-check failed ({_e}). Proceeding with SSH.")
+            api_key = None
+            ctx = None
+
     ssh = PanoramaSSHClient(ip, username, ssh_key, password)
 
     try:
-        # Step 1: Connect
-        ssh.connect()
+        # Only connect if the SSH phase is still needed.
+        if not state.get("initial_commit_done"):
+            ssh.connect()
 
         # Step 2: Check System Readiness
         # Panorama can take 15-20 minutes to fully initialize services on first boot.
@@ -688,9 +739,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
         or plugins or vm_auth_key_hours is not None
     )
 
-    api_key = None
-    ctx = None
-
+    # api_key/ctx may already be set from the pre-check above — reuse them if so.
     if _api_steps_needed:
         # Check whether all API-gated steps are already done before bothering to keygen
         _all_api_steps_done = (
@@ -707,6 +756,9 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
 
         if _all_api_steps_done:
             LOGGER.info("⏭️  All API steps already complete. Skipping API key generation.")
+        elif api_key:
+            # Reuse the key obtained during the SSH pre-check — no round-trip needed.
+            LOGGER.info("Reusing API key from pre-check.")
         else:
             api_password = state.get("api_password") or password
             if not api_password:
