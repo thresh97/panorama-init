@@ -44,14 +44,20 @@ This is the most important architectural decision before running this script. Th
 
 ### Approach A: Software Firewall Licensing via Panorama (Flex)
 
-The `sw_fw_license` plugin extends Panorama with a license manager. Authcodes are configured in Panorama and bound to specific Device Groups — when a firewall connects and is assigned to a Device Group, it is licensed via the authcodes associated with that group. The authcodes live in Panorama, not in the firewall's own bootstrap config.
+The `sw_fw_license` plugin extends Panorama with a license manager. FW Flex credit pool deployment profile authcodes are configured in Panorama and bound to specific Device Groups — when a firewall connects and is assigned to a Device Group, Panorama licenses it using the authcodes associated with that group.
+
+Licensing transactions are **proxied through Panorama** to the PAN licensing cloud. The firewall's management interface does not need direct outbound internet access to the PAN licensing cloud.
 
 Firewalls bootstrapped under this model use `authkey=` in their bootstrap configuration. This Panorama auth key is generated through the `sw_fw_license` plugin (via Panorama UI or API) — it is **not** the VM Auth Key produced by `--vm-auth-key`, and `--vm-auth-key` is not used in this approach.
+
+**Operational considerations:**
+- **License deactivation**: The sw_fw_license plugin can be configured to automatically return credits to the pool after a firewall has been disconnected for 2–24 hours — well suited for autoscaling and ephemeral deployments.
+- **Pool exhaustion**: If the credit pool is depleted at licensing time, the firewall will retry through Panorama — no manual intervention or redeployment required.
 
 **What you need on Panorama:**
 - The `sw_fw_license` plugin installed (via `--plugins`)
 - The CSP API Key configured (via `--csp-api-key`) so Panorama can communicate with the PAN licensing cloud
-- Authcodes configured in Panorama and bound to Device Groups (done in Panorama after this script completes)
+- FW Flex deployment profile authcodes configured in Panorama and bound to Device Groups (done in Panorama after this script completes)
 
 **What the firewall bootstrap needs:**
 - `panorama-server=` Panorama IP
@@ -66,9 +72,11 @@ python3 panorama_init.py \
   192.168.1.100
 ```
 
-### Approach B: Traditional Per-Device Authcodes
+### Approach B: Direct Bootstrap Licensing (FW Flex)
 
-The traditional model. Each firewall carries its own authcode in its bootstrap configuration, which it presents to the PAN licensing cloud directly on first boot.
+The authcode from a FW Flex credit pool deployment profile is placed directly in the firewall's bootstrap configuration. The firewall presents it to the PAN licensing cloud on first boot without Panorama's involvement in the licensing transaction.
+
+**The firewall's management interface requires direct outbound internet access to the PAN licensing cloud.** If your management network does not permit this, use Approach A.
 
 Firewalls bootstrapped under this model use `vm-auth-key=` in their bootstrap configuration. This is what `--vm-auth-key` generates on Panorama.
 
@@ -84,9 +92,13 @@ Authcodes can be delivered to the firewall in two ways:
 **What the firewall bootstrap needs:**
 - `panorama-server=` Panorama IP
 - `vm-auth-key=` for Panorama registration
-- `authcodes=` delivered via userdata or bootstrap package
+- `authcodes=` (FW Flex deployment profile authcode) delivered via userdata or bootstrap package
 
-> **Note:** There are known challenges when using Approach B with dedicated Log Collector groups. If your deployment uses separate Log Collectors, evaluate Approach A carefully before committing to the authcode method.
+**Operational considerations:**
+- **Licensing is one-shot**: The authcode is consumed on first successful contact with the PAN licensing cloud. If licensing fails for any reason, there is no automatic retry — manual intervention or redeployment is required.
+- **License deactivation**: Returning credits to the pool requires direct interaction with the PANW Software NGFW Licensing API. This is not handled by this script and requires custom orchestration. For autoscaling deployments this complexity should be weighed carefully against Approach A.
+
+> **Note:** There are known challenges when using Approach B with dedicated Log Collector groups. If your deployment uses separate Log Collectors, evaluate Approach A carefully before committing to this approach.
 
 ```bash
 python3 panorama_init.py \
@@ -98,13 +110,16 @@ python3 panorama_init.py \
 
 ### Summary
 
-| | Approach A (sw_fw_license / Flex) | Approach B (Authcodes) |
+| | Approach A (sw_fw_license / Flex) | Approach B (Direct Bootstrap) |
 |---|---|---|
 | Firewall bootstrap key | `authkey=` (from sw_fw_license plugin) | `vm-auth-key=` (from `--vm-auth-key`) |
 | `--vm-auth-key` on this script | **Not used** | Required |
 | `--csp-api-key` | Required (license pool auth) | Optional |
 | `sw_fw_license` plugin | Required | Not used |
-| Authcodes | Configured in Panorama, bound to Device Groups | In firewall userdata (`authcodes=`) or `/licenses/authcodes` |
+| Authcode source | FW Flex deployment profile, configured in Panorama per Device Group | FW Flex deployment profile authcode, delivered in firewall bootstrap |
+| Licensing transaction | Proxied through Panorama — no direct internet required from firewall mgmt | Firewall mgmt interface contacts PAN licensing cloud directly |
+| License deactivation | Configurable: automatic after 2–24 hours disconnection | Requires custom orchestration via PANW Software NGFW Licensing API |
+| Bootstrap failure recovery | Retries if pool depleted; Panorama manages retry | One-shot: failure requires manual intervention or redeployment |
 | Log Collector groups | Known challenges | Works well |
 
 ---
