@@ -554,9 +554,15 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
     """Executes the idempotent provisioning sequence on Panorama."""
     state = load_state(state_file)
 
-    # Persist the IP immediately so it can be recovered from the state file on re-runs.
+    # Persist IP and username immediately so they can be recovered from the state file on re-runs.
+    changed = False
     if "ip" not in state:
         state["ip"] = ip
+        changed = True
+    if "username" not in state:
+        state["username"] = username
+        changed = True
+    if changed:
         save_state(state_file, state)
 
     ssh = PanoramaSSHClient(ip, username, ssh_key, password)
@@ -1310,8 +1316,8 @@ def main():
     )
     parser.add_argument(
         "--username",
-        default="admin",
-        help="The SSH username (default: admin)."
+        default=None,
+        help="The SSH/API username. Defaults to value stored in state file, or 'admin' if not found."
     )
     parser.add_argument(
         "--ssh-key",
@@ -1407,31 +1413,34 @@ def main():
     # Resolve paths
     ssh_key_path = Path(args.ssh_key).expanduser().resolve()
 
-    # Resolve state file and IP.  IP may be omitted when --state-file is given explicitly,
-    # in which case we read it from the state file itself.
+    # Resolve state file, IP, and username. IP and username may be omitted when
+    # --state-file is given explicitly; both are read from the state file if present.
     if args.state_file:
         state_file_path = Path(args.state_file).expanduser().resolve()
-        if args.ip:
-            ip = args.ip
-        else:
-            stored = load_state(state_file_path)
-            ip = stored.get("ip")
-            if not ip:
-                parser.error(
-                    "No IP address found in the state file and none was provided. "
-                    "Please pass the IP as a positional argument."
-                )
+        stored = load_state(state_file_path)
+        ip = args.ip or stored.get("ip")
+        if not ip:
+            parser.error(
+                "No IP address found in the state file and none was provided. "
+                "Please pass the IP as a positional argument."
+            )
+        if not args.ip:
             LOGGER.info(f"Using IP '{ip}' from state file.")
     else:
         if not args.ip:
             parser.error("ip is required unless --state-file is provided.")
         ip = args.ip
         state_file_path = _discover_state_file(ip)
+        stored = load_state(state_file_path)
+
+    username = args.username or stored.get("username") or "admin"
+    if not args.username and stored.get("username"):
+        LOGGER.info(f"Using username '{username}' from state file.")
 
     try:
         provision_panorama(
             ip=ip,
-            username=args.username,
+            username=username,
             ssh_key=ssh_key_path,
             password=panorama_password,
             state_file=state_file_path,
