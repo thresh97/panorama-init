@@ -40,19 +40,21 @@ Similarly, utilizing the official `pan-os-python` SDK would normally be the most
 
 ## Firewall Licensing: Two Approaches
 
-This is the most important architectural decision before running this script. How you intend to license your VM-Series or Cloud NGFW firewalls determines which flags to use.
+This is the most important architectural decision before running this script. The two approaches use **different bootstrap keys** and are mutually exclusive — choose one for your deployment.
 
-### Approach A: Software Firewall Licensing via Panorama (recommended for scale)
+### Approach A: Software Firewall Licensing via Panorama (Flex)
 
-The `sw_fw_license` plugin turns Panorama into a centralized license manager. Firewalls receive their licenses automatically from Panorama's pool when they first connect, with no per-device authcodes required.
+The `sw_fw_license` plugin turns Panorama into a centralized license manager. Firewalls receive their licenses automatically from Panorama's pool upon connection, with no per-device authcodes required.
+
+Firewalls bootstrapped under this model use `authkey=` in their bootstrap configuration. This Panorama auth key is generated through the `sw_fw_license` plugin (via Panorama UI or API) — it is **not** the VM Auth Key produced by `--vm-auth-key`, and `--vm-auth-key` is not used in this approach.
 
 **What you need on Panorama:**
 - The `sw_fw_license` plugin installed (via `--plugins`)
 - The CSP API Key configured (via `--csp-api-key`) so Panorama can communicate with the PAN licensing cloud
-- A VM Auth Key generated (via `--vm-auth-key`) for firewall-to-Panorama registration
 
 **What the firewall bootstrap needs:**
-- Panorama IP and VM Auth Key — that's it. Licensing is handled automatically upon connection.
+- `panorama-server=` Panorama IP
+- `authkey=` generated via the sw_fw_license plugin
 
 ```bash
 python3 panorama_init.py \
@@ -60,26 +62,28 @@ python3 panorama_init.py \
   --otp abcdef123456 \
   --csp-api-key 0123456789abcdef... \
   --plugins sw_fw_license-1.2.0,sd_wan-3.3.3-h2,ztp-3.0.1 \
-  --vm-auth-key \
   192.168.1.100
 ```
 
 ### Approach B: Traditional Per-Device Authcodes
 
-The traditional model. Each firewall carries its own authcode in its bootstrap configuration, which it presents to the PAN licensing cloud directly on first boot. The VM Auth Key is still used for Panorama registration, but licensing is self-contained per device.
+The traditional model. Each firewall carries its own authcode in its bootstrap configuration, which it presents to the PAN licensing cloud directly on first boot.
+
+Firewalls bootstrapped under this model use `vm-auth-key=` in their bootstrap configuration. This is what `--vm-auth-key` generates on Panorama.
 
 Authcodes can be delivered to the firewall in two ways:
 
-- **Basic bootstrapping (userdata/instance metadata):** Pass `authcodes=XXXXXXXX` as a key in the VM's user data at launch time. Works well in most cloud deployments and is often simpler to manage than the sw_fw_license plugin.
+- **Basic bootstrapping (userdata/instance metadata):** Pass `authcodes=XXXXXXXX` in the VM's user data at launch time. Works well in most cloud deployments and is often simpler to manage than the sw_fw_license plugin.
 - **Complete bootstrapping (cloud storage / USB):** Include a `/licenses/authcodes` file in the bootstrap package stored in an S3 bucket, Azure blob, GCS bucket, or USB drive.
 
 **What you need on Panorama:**
-- VM Auth Key generated (via `--vm-auth-key`) for firewall-to-Panorama registration
+- VM Auth Key generated (via `--vm-auth-key`)
 - The `sw_fw_license` plugin is **not** used
 
 **What the firewall bootstrap needs:**
-- Panorama IP and VM Auth Key for registration
-- Authcode delivered via userdata or bootstrap package — licensing is handled independently of Panorama
+- `panorama-server=` Panorama IP
+- `vm-auth-key=` for Panorama registration
+- `authcodes=` delivered via userdata or bootstrap package
 
 > **Note:** There are known challenges when using Approach B with dedicated Log Collector groups. If your deployment uses separate Log Collectors, evaluate Approach A carefully before committing to the authcode method.
 
@@ -93,15 +97,14 @@ python3 panorama_init.py \
 
 ### Summary
 
-| | Approach A (sw_fw_license) | Approach B (Authcodes) |
+| | Approach A (sw_fw_license / Flex) | Approach B (Authcodes) |
 |---|---|---|
-| `--vm-auth-key` | Required (firewall registration) | Required (firewall registration) |
+| Firewall bootstrap key | `authkey=` (from sw_fw_license plugin) | `vm-auth-key=` (from `--vm-auth-key`) |
+| `--vm-auth-key` on this script | **Not used** | Required |
 | `--csp-api-key` | Required (license pool auth) | Optional (cert fetch only) |
 | `sw_fw_license` plugin | Required | Not used |
-| Per-firewall authcodes | Not needed | In userdata (`authcodes=`) or bootstrap package (`/licenses/authcodes`) |
+| Per-firewall authcodes | Not needed | In userdata (`authcodes=`) or `/licenses/authcodes` |
 | Log Collector groups | Known challenges | Works well |
-
-The VM Auth Key is used in both approaches — it is the credential that allows a firewall to register with Panorama during bootstrap. The two approaches differ only in how the firewall's *license* is activated once it's connected.
 
 ---
 
@@ -151,7 +154,7 @@ export PANORAMA_PASSWORD='YourSecretPassword123!'
 
 ### Example Invocations
 
-**Full provisioning — Software Firewall Licensing (Approach A):**
+**Full provisioning — Software Firewall Licensing / Flex (Approach A):**
 ```bash
 python3 panorama_init.py \
   --debug \
@@ -163,7 +166,6 @@ python3 panorama_init.py \
   --upgrade-content \
   --upgrade-av \
   --plugins sw_fw_license-1.2.0,sd_wan-3.3.3-h2,ztp-3.0.1,azure-5.2.3,aws-5.4.3 \
-  --vm-auth-key \
   192.168.1.100
 ```
 
