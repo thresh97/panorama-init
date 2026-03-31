@@ -44,13 +44,14 @@ This is the most important architectural decision before running this script. Th
 
 ### Approach A: Software Firewall Licensing via Panorama (Flex)
 
-The `sw_fw_license` plugin turns Panorama into a centralized license manager. Firewalls receive their licenses automatically from Panorama's pool upon connection, with no per-device authcodes required.
+The `sw_fw_license` plugin extends Panorama with a license manager. Authcodes are configured in Panorama and bound to specific Device Groups — when a firewall connects and is assigned to a Device Group, it is licensed via the authcodes associated with that group. The authcodes live in Panorama, not in the firewall's own bootstrap config.
 
 Firewalls bootstrapped under this model use `authkey=` in their bootstrap configuration. This Panorama auth key is generated through the `sw_fw_license` plugin (via Panorama UI or API) — it is **not** the VM Auth Key produced by `--vm-auth-key`, and `--vm-auth-key` is not used in this approach.
 
 **What you need on Panorama:**
 - The `sw_fw_license` plugin installed (via `--plugins`)
 - The CSP API Key configured (via `--csp-api-key`) so Panorama can communicate with the PAN licensing cloud
+- Authcodes configured in Panorama and bound to Device Groups (done in Panorama after this script completes)
 
 **What the firewall bootstrap needs:**
 - `panorama-server=` Panorama IP
@@ -103,7 +104,7 @@ python3 panorama_init.py \
 | `--vm-auth-key` on this script | **Not used** | Required |
 | `--csp-api-key` | Required (license pool auth) | Optional (cert fetch only) |
 | `sw_fw_license` plugin | Required | Not used |
-| Per-firewall authcodes | Not needed | In userdata (`authcodes=`) or `/licenses/authcodes` |
+| Authcodes | Configured in Panorama, bound to Device Groups | In firewall userdata (`authcodes=`) or `/licenses/authcodes` |
 | Log Collector groups | Known challenges | Works well |
 
 ---
