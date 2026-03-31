@@ -198,7 +198,7 @@ python3 panorama_init.py \
   --debug \
   --username panadmin \
   --hostname My-Panorama \
-  --serial-number 000710029871 \
+  --serial-number 000000000000 \
   --otp abcdef123456 \
   --csp-api-key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --upgrade-content \
@@ -211,7 +211,7 @@ python3 panorama_init.py \
 ```bash
 python3 panorama_init.py \
   --username panadmin \
-  --serial-number 000710029871 \
+  --serial-number 000000000000 \
   --otp abcdef123456 \
   --upgrade-content \
   --upgrade-av \
