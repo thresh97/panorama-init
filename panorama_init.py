@@ -15,6 +15,7 @@ Features:
   - Configures an API password, applies a serial number, and fetches a device certificate via XML API.
   - Configures the CSP Licensing API key.
   - Upgrades Content and Anti-Virus definitions to the latest versions.
+  - Upgrades PAN-OS to a specified target version with full reboot handling.
   - Downloads and installs specified Panorama plugins.
   - Generates and tracks a VM Auth Key for bootstrapping managed devices.
 
@@ -25,7 +26,7 @@ Prerequisites:
 
 Usage Examples:
 
-# Basic usage (defaults to admin, ~/.ssh/id_rsa, and generates an 8760-hr auth key)
+# Basic usage (defaults to admin and ~/.ssh/id_rsa)
 python panorama_provision.py 192.168.1.100
 
 # Specify custom username, SSH key, serial number, and OTP
@@ -34,8 +35,17 @@ python panorama_provision.py 10.0.0.50 --username pantech --ssh-key ~/.ssh/custo
 # Set CSP API Key, upgrade content and AV after bootstrapping
 python panorama_provision.py 10.0.0.50 --csp-api-key 043062840... --upgrade-content --upgrade-av
 
-# Install specific plugins and override the default VM auth key lifetime
-python panorama_provision.py 10.0.0.50 --plugins vm_series-3.0.0,aws-5.4.3 --vm-auth-key 4380
+# Upgrade PAN-OS to a specific version
+python panorama_provision.py 10.0.0.50 --upgrade-panos 11.2.8
+
+# Upgrade PAN-OS to the latest in the current major.minor family
+python panorama_provision.py 10.0.0.50 --upgrade-panos latest
+
+# Generate a VM Auth Key with a custom lifetime (omitting --vm-auth-key skips key generation)
+python panorama_provision.py 10.0.0.50 --vm-auth-key 4380
+
+# Install specific plugins
+python panorama_provision.py 10.0.0.50 --plugins vm_series-3.0.0,aws-5.4.3
 
 # Enable verbose XML debugging
 python panorama_provision.py 10.0.0.50 --upgrade-content --debug
@@ -70,8 +80,103 @@ LOGGER = logging.getLogger(__name__)
 # Reduce paramiko logging noise
 logging.getLogger("paramiko").setLevel(logging.WARNING)
 
+# Canonical XML command for system info — used in multiple places.
+# Fix #1: Use <system> not <s> throughout.
+_CMD_SHOW_SYSTEM_INFO = "<show><system><info/></system></show>"
+
+# Connection drop signatures that indicate an intentional server restart,
+# not a true failure. Defined once and reused across all retry loops.
+# Fix #12: Centralise this constant instead of redefining it in each step.
+_EXPECTED_DISCONNECT_ERRORS = [
+    "connection reset",
+    "remotedisconnected",
+    "eof occurred",
+    "timed out",
+    "remote end closed connection",
+    "connection refused",
+]
+
+
+def _is_expected_disconnect(exc: Exception) -> bool:
+    """Returns True if the exception looks like an intentional server restart."""
+    return any(msg in str(exc).lower() for msg in _EXPECTED_DISCONNECT_ERRORS)
+
+
+def _make_ssl_ctx() -> ssl.SSLContext:
+    """
+    Creates and returns a permissive SSL context suitable for Panorama's
+    self-signed management certificate.
+    Fix #12: Extracted into a named helper so ctx creation is never inline-duplicated.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
 
 # --- State Management ---
+def _discover_state_file(ip: str) -> Path:
+    """
+    Resolves the state file path when --state-file is not specified and the default
+    panorama-<ip>-state.json does not exist in the current directory.
+
+    - Zero candidates found  → return the default path (will start fresh).
+    - Exactly one candidate whose IP matches  → warn and return it.
+    - Exactly one candidate whose IP does NOT match  → return default (start fresh).
+    - Multiple candidates  → prompt the user to pick one or start fresh.
+    """
+    cwd = Path.cwd()
+    default = (cwd / f"panorama-{ip}-state.json").resolve()
+
+    if default.is_file():
+        return default
+
+    candidates = sorted(cwd.glob("panorama-*-state.json"))
+
+    if not candidates:
+        return default
+
+    def _extract_ip(p: Path) -> str:
+        # filename: panorama-<ip>-state.json  →  stem: panorama-<ip>-state
+        stem = p.stem  # e.g. "panorama-10.0.0.1-state"
+        return stem[len("panorama-"):-len("-state")]
+
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        if _extract_ip(candidate) == ip:
+            LOGGER.warning(
+                f"No state file found for '{ip}', but '{candidate.name}' matches "
+                f"the target IP. Using it to resume from a previous run."
+            )
+            return candidate.resolve()
+        return default  # Single file, wrong IP — start fresh
+
+    # Multiple candidates — prompt the user
+    print(
+        f"\nNo state file found for IP '{ip}', but {len(candidates)} state file(s) "
+        f"exist in the current directory:"
+    )
+    for i, f in enumerate(candidates, 1):
+        match_tag = "  ← IP matches!" if _extract_ip(f) == ip else ""
+        print(f"  [{i}] {f.name}{match_tag}")
+    print( "  [0] Start fresh (ignore all state files)")
+
+    while True:
+        try:
+            raw = input(f"Select a state file to use [0-{len(candidates)}]: ").strip()
+            choice = int(raw)
+        except (ValueError, EOFError):
+            print(f"  Please enter a number between 0 and {len(candidates)}.")
+            continue
+        if choice == 0:
+            return default
+        if 1 <= choice <= len(candidates):
+            selected = candidates[choice - 1].resolve()
+            LOGGER.warning(f"Using state file: {selected.name}")
+            return selected
+        print(f"  Please enter a number between 0 and {len(candidates)}.")
+
+
 def load_state(state_file_path: Path) -> dict:
     """Loads the deployment state from a file."""
     if not state_file_path.is_file():
@@ -111,18 +216,18 @@ def _send_op_job_command(ip, api_key, ctx, cmd_xml, timeout=30):
     raw_res = _send_op_command(ip, api_key, ctx, cmd_xml, timeout)
     try:
         response_xml = ET.fromstring(raw_res)
-        
+
         # Check for error status
         if response_xml.get('status') == 'error':
             msg = response_xml.findtext(".//msg/line", default=raw_res)
             raise RuntimeError(f"API Error: {msg}")
-        
+
         job_id_elem = response_xml.find(".//job")
         if job_id_elem is None or not job_id_elem.text:
             msg = response_xml.findtext(".//msg/line", default="")
             LOGGER.info(f"No job returned by system (might be already installed/up-to-date). Msg: {msg}")
             return None
-            
+
         return job_id_elem.text
     except ET.ParseError:
         raise RuntimeError(f"Invalid XML response: {raw_res}")
@@ -133,7 +238,7 @@ def poll_panorama_job(ip, api_key, ctx, job_id, job_name, timeout_mins=20):
     if not job_id:
         LOGGER.info(f"✅ {job_name} skipped (likely already downloaded/installed).")
         return True
-        
+
     LOGGER.info(f"Job {job_id} enqueued for {job_name}. Polling status...")
     max_attempts = timeout_mins * 4  # 15s intervals
     for attempt in range(max_attempts):
@@ -141,10 +246,10 @@ def poll_panorama_job(ip, api_key, ctx, job_id, job_name, timeout_mins=20):
         try:
             job_cmd = f"<show><jobs><id>{job_id}</id></jobs></show>"
             job_raw = _send_op_command(ip, api_key, ctx, job_cmd, timeout=10)
-            
+
             try:
                 root = ET.fromstring(job_raw)
-                
+
                 # Check for structured XML first (Newer PAN-OS versions)
                 job_node = root.find('.//job')
                 if job_node is not None:
@@ -163,18 +268,18 @@ def poll_panorama_job(ip, api_key, ctx, job_id, job_name, timeout_mins=20):
                     else:
                         LOGGER.info(f"Job {job_id} ({job_name}) processing (status: {status})... (Attempt {attempt+1}/{max_attempts})")
                         continue
-                
+
                 # Fallback to plaintext table parsing (Older PAN-OS versions)
                 result_text = root.findtext('.//result', default=job_raw)
             except ET.ParseError:
                 result_text = job_raw
-            
+
             # Replace non-breaking spaces with standard spaces
             if result_text:
                 result_text = result_text.replace('\xa0', ' ')
             else:
                 result_text = ""
-            
+
             if re.search(r'FIN\s+OK', result_text):
                 LOGGER.info(f"✅ Job {job_id} ({job_name}) completed successfully!")
                 return True
@@ -191,7 +296,7 @@ def poll_panorama_job(ip, api_key, ctx, job_id, job_name, timeout_mins=20):
             raise
         except Exception as e:
             LOGGER.debug(f"Connection error while polling (expected if mgmtsrvr restarting): {e}")
-            
+
     raise RuntimeError(f"Timed out waiting for job {job_id} ({job_name}).")
 
 
@@ -213,7 +318,7 @@ class PanoramaSSHClient:
         for attempt in range(max_retries):
             try:
                 LOGGER.info(f"Attempting SSH connection to {self.ip} (Attempt {attempt + 1}/{max_retries})...")
-                
+
                 # Attempt Key-based auth first if key file exists
                 if self.ssh_key_path and self.ssh_key_path.is_file():
                     LOGGER.debug(f"Trying key-based auth using {self.ssh_key_path}")
@@ -249,13 +354,13 @@ class PanoramaSSHClient:
                 LOGGER.info("✅ SSH connection successful.")
                 LOGGER.info("Opening interactive shell...")
                 self.shell = self.client.invoke_shell()
-                
+
                 # Wait for standard prompt (handles both user and config mode prompts)
                 self.wait_for_prompt(timeout=90)
 
                 LOGGER.info("Disabling CLI pager for this session...")
                 self.send_command("set cli pager off")
-                
+
                 LOGGER.info("✅ Interactive shell is ready.")
                 return
 
@@ -286,25 +391,25 @@ class PanoramaSSHClient:
 
             if self.shell.recv_ready():
                 output += self.shell.recv(4096).decode('utf-8', errors='ignore')
-            
+
             # Check if any of our expected prompt characters are in the tail of the output
             lines = output.split('\n')
             last_line = lines[-1] if lines else ""
-            
+
             prompt_found = any(p in last_line for p in prompt_chars)
 
             if prompt_found:
-                time.sleep(0.5) # Wait slightly to ensure output flush
+                time.sleep(0.5)  # Wait slightly to ensure output flush
                 if not self.shell.recv_ready():
                     return output
-            
+
             time.sleep(0.2)
-    
+
     def send_command(self, command, prompt_chars=['>', '#'], timeout=120):
         """Sends a command and returns the output once a prompt reappears."""
         self.shell.send(command + '\n')
         full_output = self.wait_for_prompt(prompt_chars, timeout)
-        
+
         # Clean up output (remove the echoed command and the trailing prompt)
         lines = full_output.splitlines()
         if len(lines) > 1:
@@ -312,15 +417,123 @@ class PanoramaSSHClient:
         return full_output.strip()
 
 
+# --- PAN-OS Upgrade Helpers ---
+def _get_current_panos_version(ip, api_key, ctx):
+    """Queries the device and returns the currently running PAN-OS version string."""
+    # Fix #1: Use correct <system> XML tag (not abbreviated <s>).
+    sysinfo_raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=15)
+    match = re.search(r'(?:<sw-version>|sw-version:\s*)([^<\r\n]+)', sysinfo_raw)
+    if not match:
+        raise RuntimeError("Could not determine current PAN-OS version from system info.")
+    return match.group(1).strip()
+
+
+def _resolve_panos_target_version(ip, api_key, ctx, requested_version):
+    """
+    Resolves the requested version string to an exact installable version.
+
+    - If requested_version is an exact version (e.g. '11.2.8'), it is returned as-is.
+    - If requested_version is 'latest', queries available software images and returns
+      the newest version within the same major.minor family as the currently running version.
+
+    Returns:
+        tuple: (target_version str, current_version str)
+    """
+    current_version = _get_current_panos_version(ip, api_key, ctx)
+    LOGGER.info(f"Current PAN-OS version: {current_version}")
+
+    if requested_version.lower() != "latest":
+        # Fix #7: Warn explicitly when the requested version is in a different major.minor
+        # family, since PAN-OS requires stepping through intermediate versions for major jumps.
+        current_major_minor = '.'.join(current_version.split('.')[:2])
+        target_major_minor = '.'.join(requested_version.split('.')[:2])
+        if current_major_minor != target_major_minor:
+            LOGGER.warning(
+                f"⚠️  Target version {requested_version} is in a different major.minor family "
+                f"({target_major_minor}) than the currently running version ({current_version}, "
+                f"family {current_major_minor}). PAN-OS requires upgrading through intermediate "
+                f"versions for cross-family jumps. Verify this is a supported upgrade path before "
+                f"proceeding. See: https://docs.paloaltonetworks.com/pan-os/upgrade-guide"
+            )
+        LOGGER.info(f"Target PAN-OS version (explicit): {requested_version}")
+        return requested_version, current_version
+
+    # Resolve 'latest' — first refresh the available image list from the update server.
+    LOGGER.info("Checking for available PAN-OS software images to resolve 'latest'...")
+    # Fix #3: Use correct <system> XML tag for software check command.
+    check_raw = _send_op_command(
+        ip, api_key, ctx,
+        "<request><system><software><check/></software></system></request>",
+        timeout=60
+    )
+    # Fix #6: Validate that the software check command actually succeeded before proceeding.
+    # If the device has no update server route, the check returns an error status rather
+    # than silently leaving the image list empty.
+    try:
+        check_root = ET.fromstring(check_raw)
+        if check_root.get('status') == 'error':
+            err_msg = check_root.findtext(".//msg", default=check_raw)
+            raise RuntimeError(
+                f"Software update check failed — the device may not have a route to the "
+                f"Palo Alto Networks update server. API error: {err_msg}"
+            )
+    except ET.ParseError:
+        pass  # Non-XML response is not necessarily an error; proceed and let version parse fail gracefully
+
+    # Fix #4: Use correct <system> XML tag for software status command.
+    images_raw = _send_op_command(
+        ip, api_key, ctx,
+        "<show><system><software><status/></software></system></show>",
+        timeout=30
+    )
+
+    # Fix #9: Broaden the version regex to capture all hotfix suffix formats:
+    # standard (-h1), cloud (-c1), expedited field release (-xfr1), and bare patches.
+    # The original pattern only matched -hN suffixes and would miss other valid versions.
+    versions_found = re.findall(
+        r'(?:<entry name="|version:\s*)([0-9]+\.[0-9]+\.[0-9]+[^"<\s]*)',
+        images_raw
+    )
+
+    if not versions_found:
+        raise RuntimeError(
+            "Could not parse any available PAN-OS versions from the software status output. "
+            "Ensure the device has internet access to the Palo Alto Networks update server "
+            f"and that the software check completed successfully. Raw output:\n{images_raw}"
+        )
+
+    # Restrict candidates to the same major.minor family as currently running
+    current_major_minor = '.'.join(current_version.split('.')[:2])
+    candidates = [v for v in versions_found if v.startswith(current_major_minor + '.')]
+
+    if not candidates:
+        raise RuntimeError(
+            f"No available images found for the {current_major_minor}.x family. "
+            f"All versions found: {versions_found}"
+        )
+
+    # Semantic sort: split on '.', '-', 'h', 'c', 'xfr' and compare integer segments
+    def _version_sort_key(v):
+        return [int(x) for x in re.split(r'[.\-a-zA-Z]', v) if x.isdigit()]
+
+    target_version = sorted(candidates, key=_version_sort_key)[-1]
+    LOGGER.info(
+        f"Resolved 'latest' to version: {target_version} "
+        f"(from {len(candidates)} candidates in the {current_major_minor}.x family)"
+    )
+    return target_version, current_version
+
+
 # --- Provisioning Logic ---
-def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, state_file: Path, 
+def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, state_file: Path,
                        serial_number: str = None, otp: str = None, csp_api_key: str = None,
-                       upgrade_content: bool = False, upgrade_av: bool = False, plugins: str = None,
-                       vm_auth_key_hours: int = 8760):
+                       upgrade_content: bool = False, upgrade_av: bool = False,
+                       upgrade_panos: str = None, plugins: str = None,
+                       vm_auth_key_hours: int = None):
     """Executes the idempotent provisioning sequence on Panorama."""
     state = load_state(state_file)
     ssh = PanoramaSSHClient(ip, username, ssh_key, password)
-    
+
     try:
         # Step 1: Connect
         ssh.connect()
@@ -341,7 +554,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 else:
                     LOGGER.info(f"System not ready yet. Retrying in 30 seconds... (Attempt {attempt+1}/60)")
                     time.sleep(30)
-            
+
             if not ready:
                 raise TimeoutError("Panorama system did not become ready in time.")
         else:
@@ -355,7 +568,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
             # Step 3.1: Set Admin Password for API Access
             if not state.get("admin_password_set"):
                 LOGGER.info(f"Setting password for user '{username}' to enable XML API access...")
-                
+
                 # If no password was provided via ENV, generate a secure one
                 api_password = password
                 if not api_password:
@@ -365,16 +578,16 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
 
                 # Send the password command
                 ssh.shell.send(f"set mgt-config users {username} password\n")
-                
+
                 # Handle the interactive prompts
                 ssh.wait_for_prompt(prompt_chars=['Enter password'])
                 ssh.shell.send(api_password + '\n')
-                
+
                 ssh.wait_for_prompt(prompt_chars=['Confirm password'])
                 ssh.shell.send(api_password + '\n')
-                
+
                 ssh.wait_for_prompt(prompt_chars=['#'])
-                
+
                 state["admin_password_set"] = True
                 state["api_password"] = api_password  # Store the password in state for future API calls
                 save_state(state_file, state)
@@ -387,7 +600,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 target_hostname = "Panorama-Management"
                 LOGGER.info(f"Setting hostname to '{target_hostname}'...")
                 ssh.send_command(f"set deviceconfig system hostname {target_hostname}", prompt_chars=['#'])
-                
+
                 state["hostname_set"] = True
                 save_state(state_file, state)
                 LOGGER.info("✅ Hostname configured.")
@@ -399,8 +612,11 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 LOGGER.info("Committing initial configuration... (This may take a few minutes)")
                 # Commits can take a while on Panorama, bump timeout
                 commit_output = ssh.send_command("commit", prompt_chars=['#'], timeout=600)
-                
-                if "Configuration committed successfully" in commit_output or "success" in commit_output.lower():
+
+                # Fix #13: Tighten commit success detection. The original "success" substring
+                # match was too broad and could pass on warning messages like
+                # "Successfully validated but commit may not succeed due to...".
+                if "committed successfully" in commit_output.lower():
                     LOGGER.info("✅ Initial commit successful.")
                     state["initial_commit_done"] = True
                     save_state(state_file, state)
@@ -418,47 +634,72 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
         ssh.close()
 
     # --- XML API Interactions ---
-    
-    # Generate API key once if we need to do any XML API actions
+
+    # Fix #11: Only generate an API key if at least one API-dependent step is actually
+    # needed. Avoids an unnecessary TCP connection + keygen round-trip when everything
+    # is already complete in the state file.
+    _api_steps_needed = (
+        serial_number or otp or csp_api_key
+        or upgrade_content or upgrade_av or upgrade_panos
+        or plugins or vm_auth_key_hours is not None
+    )
+
     api_key = None
-    if serial_number or otp or csp_api_key or upgrade_content or upgrade_av or plugins or vm_auth_key_hours is not None:
-        api_password = state.get("api_password") or password
-        if not api_password:
-            raise ValueError("Cannot connect to API. No password provided in ENV or generated in state file.")
+    ctx = None
 
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    if _api_steps_needed:
+        # Check whether all API-gated steps are already done before bothering to keygen
+        _all_api_steps_done = (
+            (not serial_number or state.get("serial_number_set"))
+            and (not otp or state.get("certificate_fetched"))
+            and (not csp_api_key or state.get("csp_api_key_set"))
+            and (not upgrade_content or state.get("content_upgraded"))
+            and (not upgrade_av or state.get("av_upgraded"))
+            and (not upgrade_panos or state.get("panos_upgrade_verified"))
+            and (not plugins or set(p.strip() for p in plugins.split(",") if p.strip())
+                 .issubset(set(state.get("plugins_installed", []))))
+            and (vm_auth_key_hours is None or state.get("vm_auth_key"))
+        )
 
-        LOGGER.info("Generating API Key for XML API...")
-        keygen_data = urllib.parse.urlencode({
-            'type': 'keygen',
-            'user': username,
-            'password': api_password
-        }).encode('utf-8')
-        
-        try:
-            req = urllib.request.Request(f"https://{ip}/api/", data=keygen_data)
-            res = urllib.request.urlopen(req, context=ctx, timeout=15)
-            root = ET.fromstring(res.read())
-            api_key = root.find(".//key").text
-            if not api_key:
-                raise ValueError("Failed to extract API key from response.")
-        except Exception as e:
-            raise RuntimeError(f"API Keygen failed: {e}")
+        if _all_api_steps_done:
+            LOGGER.info("⏭️  All API steps already complete. Skipping API key generation.")
+        else:
+            api_password = state.get("api_password") or password
+            if not api_password:
+                raise ValueError("Cannot connect to API. No password provided in ENV or generated in state file.")
+
+            # Fix #12: Use the centralised SSL context helper.
+            ctx = _make_ssl_ctx()
+
+            LOGGER.info("Generating API Key for XML API...")
+            keygen_data = urllib.parse.urlencode({
+                'type': 'keygen',
+                'user': username,
+                'password': api_password
+            }).encode('utf-8')
+
+            try:
+                req = urllib.request.Request(f"https://{ip}/api/", data=keygen_data)
+                res = urllib.request.urlopen(req, context=ctx, timeout=15)
+                root = ET.fromstring(res.read())
+                api_key = root.find(".//key").text
+                if not api_key:
+                    raise ValueError("Failed to extract API key from response.")
+            except Exception as e:
+                raise RuntimeError(f"API Keygen failed: {e}")
 
     # Step 5: Execute Serial Number setting via XML API
     if serial_number:
         if not state.get("serial_number_set"):
             LOGGER.info(f"Setting Panorama serial number to '{serial_number}' via XML API...")
-            
+
             command_sent = False
             for attempt in range(10):
                 try:
                     # Send exactly what the user requested, without pan-os-python auto-wrapping
                     cmd_xml = f"<set><serial-number>{serial_number}</serial-number></set>"
                     LOGGER.info(f"Sending API command (Attempt {attempt+1}/10)...")
-                    
+
                     _send_op_command(ip, api_key, ctx, cmd_xml, timeout=15)
                     command_sent = True
                     LOGGER.info("API command accepted. Panorama management server is likely restarting...")
@@ -468,41 +709,31 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     LOGGER.warning(f"API command failed: {e}. Retrying in 15 seconds...")
                     time.sleep(15)
                 except Exception as e:
-                    # If the connection drops during the call, the web server likely restarted successfully
-                    error_str = str(e).lower()
-                    expected_disconnects = [
-                        "connection reset", 
-                        "remotedisconnected", 
-                        "eof occurred", 
-                        "timed out", 
-                        "remote end closed connection",
-                        "connection refused"
-                    ]
-                    if any(msg in error_str for msg in expected_disconnects):
+                    # Fix #12: Use centralised disconnect helper.
+                    if _is_expected_disconnect(e):
                         LOGGER.warning(f"Connection dropped during API call (expected behavior as web server reboots): {e}")
                         command_sent = True
                         break
-
                     LOGGER.warning(f"API command failed: {e}. Retrying in 15 seconds...")
                     time.sleep(15)
-            
+
             if not command_sent:
                 raise RuntimeError("Failed to set serial number via XML API after multiple attempts.")
-            
+
             # Now wait for the web server to come back up and verify the serial number
             LOGGER.info("Waiting for Panorama web server to come back up and verifying serial number...")
             serial_verified = False
             for attempt in range(24):  # Wait up to 6 minutes (24 * 15s)
                 time.sleep(15)
                 try:
-                    sysinfo_raw = _send_op_command(ip, api_key, ctx, "<show><system><info/></system></show>", timeout=10)
-                    
-                    # PAN-OS sometimes returns plain text wrapped in a <result> tag for this command
+                    # Fix #1: Use the canonical _CMD_SHOW_SYSTEM_INFO constant.
+                    sysinfo_raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10)
+
                     if f"<serial>{serial_number}</serial>" in sysinfo_raw or f"serial: {serial_number}" in sysinfo_raw:
                         LOGGER.info(f"✅ Serial number '{serial_number}' successfully verified!")
                         serial_verified = True
                         break
-                    
+
                     match = re.search(r'(?:<serial>|serial:\s*)([^<\r\n]+)', sysinfo_raw)
                     current_serial = match.group(1).strip() if match else "unknown"
 
@@ -513,7 +744,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
 
             if not serial_verified:
                 raise RuntimeError("Panorama web server did not return the expected serial number after restarting.")
-            
+
             state["serial_number_set"] = True
             state["serial_number"] = serial_number
             save_state(state_file, state)
@@ -525,24 +756,25 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
         if not state.get("certificate_fetched"):
             LOGGER.info("Checking current device certificate status...")
             cert_already_valid = False
-            
-            for attempt in range(3): # Short retry in case mgmtsrvr is just settling
+
+            for attempt in range(3):  # Short retry in case mgmtsrvr is just settling
                 try:
-                    sysinfo_raw = _send_op_command(ip, api_key, ctx, "<show><system><info/></system></show>", timeout=10)
-                    
+                    # Fix #1: Use the canonical _CMD_SHOW_SYSTEM_INFO constant.
+                    sysinfo_raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10)
+
                     if "device-certificate-status: Valid" in sysinfo_raw or "<device-certificate-status>Valid</device-certificate-status>" in sysinfo_raw:
                         LOGGER.info("✅ Device certificate is already 'Valid'. Skipping OTP fetch.")
                         cert_already_valid = True
                         state["certificate_fetched"] = True
                         save_state(state_file, state)
-                    break # Success checking status, exit loop
+                    break  # Success checking status, exit loop
                 except Exception as e:
                     LOGGER.debug(f"Pre-check connection error: {e}. Retrying...")
                     time.sleep(5)
 
             if not cert_already_valid:
                 LOGGER.info(f"Fetching device certificate using OTP via XML API...")
-                
+
                 # 1. Dispatch the Fetch Job
                 try:
                     cmd_xml = f"<request><certificate><fetch><otp>{otp}</otp></fetch></certificate></request>"
@@ -552,15 +784,15 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     LOGGER.info(f"Certificate fetch job enqueued with ID: {job_id}. Monitoring progress...")
                 except Exception as e:
                     raise RuntimeError(f"Failed to enqueue device certificate fetch job: {e}")
-                
+
                 # 2. Poll the Job Status and System Info
                 cert_valid = False
                 for attempt in range(30):  # Wait up to 7.5 minutes (30 * 15s)
                     time.sleep(15)
                     try:
-                        # Best validation: Check if system info reports the cert is valid
-                        sysinfo_raw = _send_op_command(ip, api_key, ctx, "<show><system><info/></system></show>", timeout=10)
-                        
+                        # Fix #1: Use the canonical _CMD_SHOW_SYSTEM_INFO constant.
+                        sysinfo_raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10)
+
                         if "device-certificate-status: Valid" in sysinfo_raw or "<device-certificate-status>Valid</device-certificate-status>" in sysinfo_raw:
                             LOGGER.info("✅ Device certificate fetched and successfully verified!")
                             cert_valid = True
@@ -569,8 +801,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                         # If not valid yet, check job status to fail fast if OTP was rejected
                         job_cmd = f"<show><jobs><id>{job_id}</id></jobs></show>"
                         job_raw = _send_op_command(ip, api_key, ctx, job_cmd, timeout=10)
-                        
-                        # Parse XML to check structured FIN FAIL or fallback to plaintext extraction
+
                         try:
                             root = ET.fromstring(job_raw)
                             job_node = root.find('.//job')
@@ -580,30 +811,29 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                                 if status == 'FIN' and res_val == 'FAIL':
                                     LOGGER.error(f"Certificate fetch job {job_id} failed. Raw output:\n{job_raw}")
                                     raise RuntimeError("Device certificate fetch failed (invalid OTP or network error).")
-                                
+
                             result_text = root.findtext('.//result', default=job_raw)
                         except ET.ParseError:
                             result_text = job_raw
-                            
+
                         if result_text:
                             result_text = result_text.replace('\xa0', ' ')
                         else:
                             result_text = ""
-                        
+
                         if re.search(r'FIN\s+FAIL', result_text):
                             LOGGER.error(f"Certificate fetch job {job_id} failed. Raw output:\n{result_text}")
                             raise RuntimeError("Device certificate fetch failed (invalid OTP or network error).")
-                        
+
                         LOGGER.info(f"Job {job_id} processing, cert not yet valid... (Attempt {attempt+1}/30)")
                     except RuntimeError:
-                        raise # Re-raise the FIN FAIL runtime error immediately
+                        raise  # Re-raise the FIN FAIL runtime error immediately
                     except Exception as e:
-                        # The web server sometimes restarts after a certificate is applied, similar to the serial number
                         LOGGER.debug(f"Connection error while polling (expected if mgmtsrvr is restarting): {e}")
 
                 if not cert_valid:
                     raise RuntimeError(f"Timed out waiting for device certificate to become 'Valid'.")
-                
+
                 state["certificate_fetched"] = True
                 save_state(state_file, state)
         else:
@@ -616,14 +846,14 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
             try:
                 cmd_xml = f"<request><license><api-key><set><key>{csp_api_key}</key></set></api-key></license></request>"
                 raw_response = _send_op_command(ip, api_key, ctx, cmd_xml, timeout=30)
-                
+
                 if 'status="error"' in raw_response.lower() and 'same as old' in raw_response.lower():
                     LOGGER.info("✅ CSP API key is already set to the provided value.")
                 elif 'status="error"' in raw_response.lower():
                     raise RuntimeError(f"Failed to set CSP API key. Raw response: {raw_response}")
                 else:
                     LOGGER.info("✅ CSP API key applied successfully.")
-                    
+
                 state["csp_api_key_set"] = True
                 save_state(state_file, state)
             except Exception as e:
@@ -640,17 +870,17 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 LOGGER.info("1/3 Checking for latest content updates...")
                 check_cmd = "<request><content><upgrade><check/></upgrade></content></request>"
                 _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
-                
+
                 LOGGER.info("2/3 Downloading latest content update...")
                 dl_cmd = "<request><content><upgrade><download><latest/></download></upgrade></content></request>"
                 dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
                 poll_panorama_job(ip, api_key, ctx, dl_job_id, "Content Download")
-                
+
                 LOGGER.info("3/3 Installing latest content update...")
                 inst_cmd = "<request><content><upgrade><install><version>latest</version></install></upgrade></content></request>"
                 inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
                 poll_panorama_job(ip, api_key, ctx, inst_job_id, "Content Install")
-                
+
                 state["content_upgraded"] = True
                 save_state(state_file, state)
             except Exception as e:
@@ -667,17 +897,17 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 LOGGER.info("1/3 Checking for latest Anti-Virus updates...")
                 check_cmd = "<request><anti-virus><upgrade><check/></upgrade></anti-virus></request>"
                 _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
-                
+
                 LOGGER.info("2/3 Downloading latest Anti-Virus update...")
                 dl_cmd = "<request><anti-virus><upgrade><download><latest/></download></upgrade></anti-virus></request>"
                 dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
                 poll_panorama_job(ip, api_key, ctx, dl_job_id, "Anti-Virus Download")
-                
+
                 LOGGER.info("3/3 Installing latest Anti-Virus update...")
                 inst_cmd = "<request><anti-virus><upgrade><install><version>latest</version></install></upgrade></anti-virus></request>"
                 inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
                 poll_panorama_job(ip, api_key, ctx, inst_job_id, "Anti-Virus Install")
-                
+
                 state["av_upgraded"] = True
                 save_state(state_file, state)
             except Exception as e:
@@ -686,13 +916,175 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
         else:
             LOGGER.info("⏭️  Skipping Anti-Virus upgrade (already complete).")
 
-    # Step 10: Plugin Installation via XML API
+    # Step 10: PAN-OS Upgrade via XML API
+    # Ordered before plugins so plugins are always installed against the final OS version.
+    # Uses four granular state keys so a mid-flight failure (e.g. killed during reboot wait)
+    # resumes at exactly the right sub-step without re-downloading the image.
+    if upgrade_panos:
+        if not state.get("panos_upgrade_verified"):
+            LOGGER.info("Starting PAN-OS Upgrade process...")
+            try:
+                # Resolve the exact target version, reusing a previously stored result
+                # so an interrupted run doesn't re-query on resume.
+                if not state.get("panos_target_version"):
+                    target_version, current_version = _resolve_panos_target_version(
+                        ip, api_key, ctx, upgrade_panos
+                    )
+                    state["panos_target_version"] = target_version
+                    state["panos_current_version_before_upgrade"] = current_version
+                    save_state(state_file, state)
+                else:
+                    target_version = state["panos_target_version"]
+                    current_version = state.get("panos_current_version_before_upgrade", "unknown")
+                    LOGGER.info(f"Resuming PAN-OS upgrade to {target_version} (resolved in a previous run).")
+
+                # Guard: already running the target version (covers re-runs after a successful upgrade)
+                live_version = _get_current_panos_version(ip, api_key, ctx)
+                if live_version == target_version:
+                    LOGGER.info(f"✅ Already running target PAN-OS version {target_version}. Nothing to do.")
+                    state["panos_upgrade_verified"] = True
+                    save_state(state_file, state)
+                else:
+                    LOGGER.info(f"Upgrading PAN-OS: {current_version} → {target_version}")
+
+                    # Sub-step 1: Download the target image.
+                    # PAN-OS images are ~1 GB; allow 30 mins for the download job.
+                    if not state.get("panos_upgrade_downloaded"):
+                        LOGGER.info(f"1/4 Downloading PAN-OS {target_version}...")
+                        # Fix #4: Use correct <system> XML tag for download command.
+                        dl_cmd = (
+                            f"<request><system><software><download>"
+                            f"<version>{target_version}</version>"
+                            f"</download></software></system></request>"
+                        )
+                        dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
+                        poll_panorama_job(
+                            ip, api_key, ctx, dl_job_id,
+                            f"PAN-OS Download ({target_version})",
+                            timeout_mins=30
+                        )
+                        state["panos_upgrade_downloaded"] = True
+                        save_state(state_file, state)
+                    else:
+                        LOGGER.info("⏭️  Skipping PAN-OS image download (already complete).")
+
+                    # Sub-step 2: Install the downloaded image (pre-reboot).
+                    if not state.get("panos_upgrade_installed"):
+                        LOGGER.info(f"2/4 Installing PAN-OS {target_version}...")
+                        # Fix #4: Use correct <system> XML tag for install command.
+                        inst_cmd = (
+                            f"<request><system><software><install>"
+                            f"<version>{target_version}</version>"
+                            f"</install></software></system></request>"
+                        )
+                        inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
+                        poll_panorama_job(
+                            ip, api_key, ctx, inst_job_id,
+                            f"PAN-OS Install ({target_version})",
+                            timeout_mins=20
+                        )
+                        state["panos_upgrade_installed"] = True
+                        save_state(state_file, state)
+                    else:
+                        LOGGER.info("⏭️  Skipping PAN-OS image installation (already complete).")
+
+                    # Sub-step 3: Reboot to activate the new image.
+                    # Unlike content/AV, a PAN-OS upgrade requires a full system reboot.
+                    # The reboot command is fire-and-forget — the connection will drop immediately,
+                    # so we mirror the serial number step's disconnect-handling pattern.
+                    if not state.get("panos_upgrade_rebooted"):
+                        LOGGER.info("3/4 Initiating system reboot to activate new PAN-OS version...")
+                        reboot_cmd = "<request><restart><system/></restart></request>"
+                        reboot_sent = False
+
+                        for attempt in range(5):
+                            try:
+                                # Fix #5: Use timeout=5 so we strongly favour catching the
+                                # expected connection drop rather than waiting for a full response
+                                # that will never arrive once the device starts rebooting.
+                                _send_op_command(ip, api_key, ctx, reboot_cmd, timeout=5)
+                                LOGGER.info("Reboot command accepted by device.")
+                                reboot_sent = True
+                                break
+                            except Exception as e:
+                                # Fix #12: Use centralised disconnect helper.
+                                if _is_expected_disconnect(e):
+                                    LOGGER.info(
+                                        "Connection dropped after reboot command (expected — "
+                                        "Panorama is rebooting)."
+                                    )
+                                    reboot_sent = True
+                                    break
+                                LOGGER.warning(f"Reboot attempt {attempt+1}/5 failed: {e}. Retrying in 10 seconds...")
+                                time.sleep(10)
+
+                        if not reboot_sent:
+                            raise RuntimeError("Failed to send reboot command to Panorama after multiple attempts.")
+
+                        state["panos_upgrade_rebooted"] = True
+                        save_state(state_file, state)
+                    else:
+                        LOGGER.info("⏭️  Skipping reboot (already triggered in a previous run). "
+                                    "Proceeding directly to post-reboot verification.")
+
+                    # Sub-step 4: Wait for Panorama to come back up and verify the new version.
+                    # A PAN-OS upgrade reboot typically takes 10-20 minutes on Panorama.
+                    # We poll every 15 seconds for up to ~20 minutes (80 attempts).
+                    LOGGER.info("4/4 Waiting for Panorama to come back up after reboot...")
+                    LOGGER.info("(A PAN-OS upgrade reboot typically takes 10–20 minutes on Panorama)")
+                    version_verified = False
+
+                    for attempt in range(80):  # Up to ~20 mins (80 * 15s)
+                        time.sleep(15)
+                        try:
+                            # Fix #1: Use the canonical _CMD_SHOW_SYSTEM_INFO constant.
+                            sysinfo_raw = _send_op_command(
+                                ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10
+                            )
+                            # Check both XML-structured and plaintext response formats,
+                            # mirroring the serial number verification pattern.
+                            if (f"<sw-version>{target_version}</sw-version>" in sysinfo_raw
+                                    or f"sw-version: {target_version}" in sysinfo_raw):
+                                LOGGER.info(f"✅ PAN-OS version successfully verified: {target_version}")
+                                version_verified = True
+                                break
+
+                            # Device is up but running an unexpected version — log and keep waiting
+                            match = re.search(r'(?:<sw-version>|sw-version:\s*)([^<\r\n]+)', sysinfo_raw)
+                            running_version = match.group(1).strip() if match else "unknown"
+                            LOGGER.info(
+                                f"Web server is up, but running version is '{running_version}' "
+                                f"(expected '{target_version}'). Waiting... (Attempt {attempt+1}/80)"
+                            )
+                        except Exception as e:
+                            LOGGER.debug(
+                                f"Web server still unreachable — Panorama is likely still rebooting. "
+                                f"(Attempt {attempt+1}/80)"
+                            )
+
+                    if not version_verified:
+                        raise RuntimeError(
+                            f"Timed out waiting for Panorama to come back up running PAN-OS {target_version}. "
+                            f"The device may still be rebooting — re-run this script to resume verification."
+                        )
+
+                    state["panos_upgrade_verified"] = True
+                    save_state(state_file, state)
+
+            except Exception as e:
+                LOGGER.error(f"PAN-OS upgrade failed: {e}")
+                raise
+        else:
+            completed_version = state.get("panos_target_version", upgrade_panos)
+            LOGGER.info(f"⏭️  Skipping PAN-OS upgrade (already on {completed_version}).")
+
+    # Step 11: Plugin Installation via XML API
     if plugins:
         plugin_list = [p.strip() for p in plugins.split(",") if p.strip()]
-        
+
         LOGGER.info("Checking currently installed plugins on the device...")
         installed_cmd = "<show><plugins><installed/></plugins></show>"
-        
+
         installed_raw = ""
         for attempt in range(6):
             try:
@@ -701,12 +1093,25 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
             except Exception as e:
                 LOGGER.debug(f"Connection error while checking installed plugins: {e}. Retrying...")
                 time.sleep(10)
-        
+
         installed_plugins_state = state.get("plugins_installed", [])
         plugins_to_install = []
-        
+
         for p in plugin_list:
-            if p in installed_raw:
+            # Fix #10: Match the full plugin name as a complete token rather than using
+            # a raw substring check. The original `if p in installed_raw` would incorrectly
+            # skip 'aws-5.4.3' if 'aws-5.4' was already present in the response string,
+            # leading to a silently missed install.
+            #
+            # We use a word-boundary-aware pattern so that 'aws-5.4' does NOT match 'aws-5.4.3'.
+            # The pattern anchors the plugin name and requires it to be followed by a non-version
+            # character (whitespace, tag close, or end of string).
+            plugin_in_device = bool(re.search(
+                re.escape(p) + r'(?=[<\s"\']|$)',
+                installed_raw
+            ))
+
+            if plugin_in_device:
                 LOGGER.info(f"✅ Plugin '{p}' is already installed on the device. Skipping.")
                 if p not in installed_plugins_state:
                     installed_plugins_state.append(p)
@@ -714,36 +1119,37 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 LOGGER.info(f"✅ Plugin '{p}' is marked as installed in state file. Skipping.")
             else:
                 plugins_to_install.append(p)
-                
+
         state["plugins_installed"] = installed_plugins_state
         save_state(state_file, state)
-        
+
         if plugins_to_install:
             LOGGER.info(f"Starting Plugin Installation process for: {', '.join(plugins_to_install)}")
             try:
                 LOGGER.info("Checking for available plugins...")
                 check_cmd = "<request><plugins><check/></plugins></request>"
                 _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
-                
+
                 for plugin in plugins_to_install:
                     LOGGER.info(f"Downloading plugin '{plugin}'...")
                     dl_cmd = f"<request><plugins><download><file>{plugin}</file></download></plugins></request>"
                     dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
                     poll_panorama_job(ip, api_key, ctx, dl_job_id, f"Plugin Download ({plugin})")
-                    
+
                     LOGGER.info(f"Installing plugin '{plugin}'...")
                     inst_cmd = f"<request><plugins><install>{plugin}</install></plugins></request>"
                     inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
                     poll_panorama_job(ip, api_key, ctx, inst_job_id, f"Plugin Install ({plugin})")
-                    
-                    # Validation step
+
+                    # Validation step — use the same exact-match regex as the pre-check above.
                     LOGGER.info(f"Validating installation of '{plugin}'...")
                     verified = False
                     for val_attempt in range(12):  # Wait up to 3 minutes
                         time.sleep(15)
                         try:
                             validate_raw = _send_op_command(ip, api_key, ctx, installed_cmd, timeout=15)
-                            if plugin in validate_raw:
+                            # Fix #10: Consistent exact-match check in the validation loop.
+                            if re.search(re.escape(plugin) + r'(?=[<\s"\']|$)', validate_raw):
                                 LOGGER.info(f"✅ Verified '{plugin}' appears in installed plugins list.")
                                 verified = True
                                 break
@@ -751,49 +1157,52 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                                 LOGGER.info(f"Plugin '{plugin}' not yet in installed list. Waiting... (Attempt {val_attempt+1}/12)")
                         except Exception as e:
                             LOGGER.debug(f"Web server unreachable during validation (likely restarting): {e}")
-                    
+
                     if not verified:
                         LOGGER.warning(f"Plugin '{plugin}' installed via job, but could not be verified in 'show plugins installed'.")
-                    
+
                     installed_plugins_state.append(plugin)
                     state["plugins_installed"] = installed_plugins_state
                     save_state(state_file, state)
-                    
+
             except Exception as e:
                 LOGGER.error(f"Plugin installation failed: {e}")
                 raise
         else:
             LOGGER.info("⏭️  Skipping Plugin installation (all requested plugins already installed).")
 
-    # Step 11: Generate VM Auth Key
+    # Step 12: Generate VM Auth Key
+    # Fix #8: Default is now None so that omitting --vm-auth-key on the CLI correctly
+    # skips this step. The original default of 8760 meant the key was always generated,
+    # even when the flag was never passed.
     if vm_auth_key_hours is not None:
         if not state.get("vm_auth_key"):
             LOGGER.info(f"Generating VM Auth Key with lifetime {vm_auth_key_hours} hours...")
             try:
                 cmd_xml = f"<request><bootstrap><vm-auth-key><generate><lifetime>{vm_auth_key_hours}</lifetime></generate></vm-auth-key></bootstrap></request>"
                 raw_response = _send_op_command(ip, api_key, ctx, cmd_xml, timeout=30)
-                
+
                 # Parse the response XML to extract the text
                 try:
                     root = ET.fromstring(raw_response)
                     result_text = root.findtext(".//result", default=raw_response)
                 except ET.ParseError:
                     result_text = raw_response
-                
+
                 # Expected format: "VM auth key 891933040429594 generated. Expires at: 2027/03/30 13:03:21"
                 match = re.search(r"VM auth key\s+(\S+)\s+generated\.\s+Expires at:\s+(.*)", result_text)
                 if match:
                     auth_key = match.group(1).strip()
                     expiry = match.group(2).strip()
                     LOGGER.info(f"✅ VM Auth Key generated: {auth_key} (Expires: {expiry})")
-                    
+
                     state["vm_auth_key"] = auth_key
                     state["vm_auth_key_expiry"] = expiry
                     save_state(state_file, state)
                 else:
                     LOGGER.warning(f"Could not parse VM Auth Key from response: {result_text}")
                     raise RuntimeError("Failed to parse VM Auth Key from response.")
-                    
+
             except Exception as e:
                 LOGGER.error(f"Failed to generate VM Auth Key: {e}")
                 raise
@@ -813,26 +1222,26 @@ def main():
 
     # Positional argument for IP
     parser.add_argument(
-        "ip", 
+        "ip",
         help="The IP address of the Panorama VM to connect to."
     )
-    
+
     # Optional arguments
     parser.add_argument(
-        "--username", 
-        default="admin", 
+        "--username",
+        default="admin",
         help="The SSH username (default: admin)."
     )
     parser.add_argument(
-        "--ssh-key", 
-        default="~/.ssh/id_rsa", 
-        metavar="PATH", 
+        "--ssh-key",
+        default="~/.ssh/id_rsa",
+        metavar="PATH",
         help="Path to your SSH private key file (default: ~/.ssh/id_rsa)."
     )
     parser.add_argument(
-        "--state-file", 
-        default=None, 
-        metavar="PATH", 
+        "--state-file",
+        default=None,
+        metavar="PATH",
         help="Path to save the state JSON file. Defaults to './panorama-<ip>-state.json'."
     )
     parser.add_argument(
@@ -861,6 +1270,22 @@ def main():
         help="Check, download, and install the latest Anti-Virus update."
     )
     parser.add_argument(
+        "--upgrade-panos",
+        default=None,
+        metavar="VERSION",
+        help=(
+            "Upgrade PAN-OS to the specified version (e.g. 11.2.8).\n"
+            "Use 'latest' to automatically select the newest available version\n"
+            "within the same major.minor family as the currently running version.\n"
+            "Note: This triggers a full system reboot. The script will wait up to\n"
+            "20 minutes for Panorama to come back up and verify the new version.\n"
+            "If the script is interrupted during the reboot wait, simply re-run\n"
+            "the same command — it will resume at the verification step.\n"
+            "Cross-family upgrades (e.g. 10.2 → 11.0) require stepping through\n"
+            "intermediate versions and will produce a warning."
+        )
+    )
+    parser.add_argument(
         "--plugins",
         default=None,
         help="Comma-separated list of plugins to download and install (e.g. vm_series-2.1.6,aws-3.0.0)."
@@ -871,8 +1296,18 @@ def main():
         type=int,
         nargs='?',
         const=8760,
-        default=8760,
-        help="Generate a VM auth key with the specified lifetime in hours (default: 8760)."
+        # Fix #8: Default changed from 8760 to None.
+        # With default=8760, the VM auth key step ran unconditionally on every invocation
+        # because the guard `if vm_auth_key_hours is not None` was always True.
+        # Now, omitting --vm-auth-key entirely skips key generation.
+        # Passing --vm-auth-key with no value uses the 8760-hour default.
+        # Passing --vm-auth-key 4380 uses the specified lifetime.
+        default=None,
+        help=(
+            "Generate a VM auth key with the specified lifetime in hours.\n"
+            "Passing the flag without a value uses the default of 8760 hours (1 year).\n"
+            "Omitting this flag entirely skips VM auth key generation."
+        )
     )
     parser.add_argument(
         "--debug",
@@ -890,11 +1325,11 @@ def main():
 
     # Resolve paths
     ssh_key_path = Path(args.ssh_key).expanduser().resolve()
-    
+
     if args.state_file:
         state_file_path = Path(args.state_file).expanduser().resolve()
     else:
-        state_file_path = Path(f"panorama-{args.ip}-state.json").resolve()
+        state_file_path = _discover_state_file(args.ip)
 
     try:
         provision_panorama(
@@ -908,6 +1343,7 @@ def main():
             csp_api_key=args.csp_api_key,
             upgrade_content=args.upgrade_content,
             upgrade_av=args.upgrade_av,
+            upgrade_panos=args.upgrade_panos,
             plugins=args.plugins,
             vm_auth_key_hours=args.vm_auth_key_hours
         )
