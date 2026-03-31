@@ -40,7 +40,7 @@ Similarly, utilizing the official `pan-os-python` SDK would normally be the most
 
 ## Firewall Licensing: Two Approaches
 
-This is the most important architectural decision before running this script. The two approaches use **different bootstrap keys** and are mutually exclusive — choose one for your deployment.
+This is the most important architectural decision before running this script. The two approaches use **different bootstrap keys** and are mutually exclusive **per firewall** — a single Panorama can support both simultaneously, but each VM-Series firewall can only be licensed via one method in its bootstrap.
 
 ### Approach A: Software Firewall Licensing via Panorama (Flex)
 
