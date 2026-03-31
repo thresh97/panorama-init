@@ -61,7 +61,11 @@ Firewalls bootstrapped under this model use `authkey=` in their bootstrap config
 
 **What the firewall bootstrap needs:**
 - `panorama-server=` Panorama IP
+- `panorama-server-2=` secondary Panorama IP (optional)
 - `authkey=` generated via the sw_fw_license plugin
+- `plugin-op-commands=panorama-licensing-mode-on`
+
+See [Panorama-Based Software Firewall License Management](https://docs.paloaltonetworks.com/vm-series/11-1/vm-series-deployment/license-the-vm-series-firewall/use-panorama-based-software-firewall-license-management) for full plugin configuration details.
 
 ```bash
 python3 panorama_init.py \
@@ -91,12 +95,13 @@ Authcodes can be delivered to the firewall in two ways:
 
 **What the firewall bootstrap needs:**
 - `panorama-server=` Panorama IP
+- `panorama-server-2=` secondary Panorama IP (optional)
 - `vm-auth-key=` for Panorama registration
 - `authcodes=` (FW Flex deployment profile authcode) delivered via userdata or bootstrap package
 
 **Operational considerations:**
 - **Licensing is one-shot**: The authcode is consumed on first successful contact with the PAN licensing cloud. If licensing fails for any reason, there is no automatic retry — manual intervention or redeployment is required.
-- **License deactivation**: Returning credits to the pool requires direct interaction with the PANW Software NGFW Licensing API. This is not handled by this script and requires custom orchestration. For autoscaling deployments this complexity should be weighed carefully against Approach A.
+- **License deactivation**: Returning credits to the pool requires direct interaction with the [PANW Software NGFW Licensing API](https://docs.paloaltonetworks.com/vm-series/11-1/vm-series-deployment/license-the-vm-series-firewall/software-ngfw/software-ngfw-licensing-api). This is not handled by this script and requires custom orchestration. For autoscaling deployments this complexity should be weighed carefully against Approach A.
 
 > **Note:** There are known challenges when using Approach B with dedicated Log Collector groups. If your deployment uses separate Log Collectors, evaluate Approach A carefully before committing to this approach.
 
