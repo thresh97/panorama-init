@@ -233,6 +233,26 @@ def _send_op_job_command(ip, api_key, ctx, cmd_xml, timeout=30):
         raise RuntimeError(f"Invalid XML response: {raw_res}")
 
 
+def _is_already_latest(check_response: str, label: str) -> bool:
+    """
+    Parses a content/AV upgrade check response and returns True if the currently
+    installed version is already the latest available, making a download unnecessary.
+    Looks for an entry where both <current>yes</current> and <latest>yes</latest>.
+    """
+    try:
+        root = ET.fromstring(check_response)
+        for entry in root.findall(".//entry"):
+            current = entry.findtext("current", default="no").strip().lower()
+            latest = entry.findtext("latest", default="no").strip().lower()
+            if current == "yes" and latest == "yes":
+                version = entry.findtext("version", default="unknown")
+                LOGGER.info(f"✅ {label} is already at the latest version ({version}). Skipping download/install.")
+                return True
+    except ET.ParseError:
+        LOGGER.debug(f"Could not parse {label} check response. Proceeding with update.")
+    return False
+
+
 def poll_panorama_job(ip, api_key, ctx, job_id, job_name, timeout_mins=20):
     """Polls a Panorama Job ID until completion or failure."""
     if not job_id:
@@ -609,20 +629,30 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
 
             # Step 4: Commit Configuration
             if not state.get("initial_commit_done"):
-                LOGGER.info("Committing initial configuration... (This may take a few minutes)")
-                # Commits can take a while on Panorama, bump timeout
-                commit_output = ssh.send_command("commit", prompt_chars=['#'], timeout=600)
-
-                # Fix #13: Tighten commit success detection. The original "success" substring
-                # match was too broad and could pass on warning messages like
-                # "Successfully validated but commit may not succeed due to...".
-                if "committed successfully" in commit_output.lower():
-                    LOGGER.info("✅ Initial commit successful.")
+                # Check whether there are actually pending candidate config changes before
+                # committing. 'show config diff' returns an empty string when candidate and
+                # running configs are identical, letting us skip a ~40-second commit on an
+                # already-configured device that was rerun without a state file.
+                diff_output = ssh.send_command("show config diff", prompt_chars=['#'], timeout=30)
+                if not diff_output.strip():
+                    LOGGER.info("⏭️  No pending config changes detected. Skipping commit.")
                     state["initial_commit_done"] = True
                     save_state(state_file, state)
                 else:
-                    LOGGER.error(f"Commit may have failed. Output:\n{commit_output}")
-                    raise RuntimeError("Commit process did not return expected success message.")
+                    LOGGER.info("Committing initial configuration... (This may take a few minutes)")
+                    # Commits can take a while on Panorama, bump timeout
+                    commit_output = ssh.send_command("commit", prompt_chars=['#'], timeout=600)
+
+                    # Fix #13: Tighten commit success detection. The original "success" substring
+                    # match was too broad and could pass on warning messages like
+                    # "Successfully validated but commit may not succeed due to...".
+                    if "committed successfully" in commit_output.lower():
+                        LOGGER.info("✅ Initial commit successful.")
+                        state["initial_commit_done"] = True
+                        save_state(state_file, state)
+                    else:
+                        LOGGER.error(f"Commit may have failed. Output:\n{commit_output}")
+                        raise RuntimeError("Commit process did not return expected success message.")
 
             # Exit config mode
             ssh.send_command("exit", prompt_chars=['>'])
@@ -690,6 +720,22 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
 
     # Step 5: Execute Serial Number setting via XML API
     if serial_number:
+        if not state.get("serial_number_set"):
+            # Live pre-check: query system info before sending the set command.
+            # Re-setting a serial that is already correct triggers an unnecessary
+            # web server restart and a 15+ second wait.
+            LOGGER.info(f"Checking current serial number before applying...")
+            try:
+                sysinfo_raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10)
+                if (f"<serial>{serial_number}</serial>" in sysinfo_raw
+                        or f"serial: {serial_number}" in sysinfo_raw):
+                    LOGGER.info(f"✅ Serial number '{serial_number}' is already set. Skipping.")
+                    state["serial_number_set"] = True
+                    state["serial_number"] = serial_number
+                    save_state(state_file, state)
+            except Exception as e:
+                LOGGER.debug(f"Serial pre-check failed ({e}). Proceeding with set command.")
+
         if not state.get("serial_number_set"):
             LOGGER.info(f"Setting Panorama serial number to '{serial_number}' via XML API...")
 
@@ -869,17 +915,18 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
             try:
                 LOGGER.info("1/3 Checking for latest content updates...")
                 check_cmd = "<request><content><upgrade><check/></upgrade></content></request>"
-                _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
+                check_response = _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
 
-                LOGGER.info("2/3 Downloading latest content update...")
-                dl_cmd = "<request><content><upgrade><download><latest/></download></upgrade></content></request>"
-                dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
-                poll_panorama_job(ip, api_key, ctx, dl_job_id, "Content Download")
+                if not _is_already_latest(check_response, "Content"):
+                    LOGGER.info("2/3 Downloading latest content update...")
+                    dl_cmd = "<request><content><upgrade><download><latest/></download></upgrade></content></request>"
+                    dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
+                    poll_panorama_job(ip, api_key, ctx, dl_job_id, "Content Download")
 
-                LOGGER.info("3/3 Installing latest content update...")
-                inst_cmd = "<request><content><upgrade><install><version>latest</version></install></upgrade></content></request>"
-                inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
-                poll_panorama_job(ip, api_key, ctx, inst_job_id, "Content Install")
+                    LOGGER.info("3/3 Installing latest content update...")
+                    inst_cmd = "<request><content><upgrade><install><version>latest</version></install></upgrade></content></request>"
+                    inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
+                    poll_panorama_job(ip, api_key, ctx, inst_job_id, "Content Install")
 
                 state["content_upgraded"] = True
                 save_state(state_file, state)
@@ -896,17 +943,18 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
             try:
                 LOGGER.info("1/3 Checking for latest Anti-Virus updates...")
                 check_cmd = "<request><anti-virus><upgrade><check/></upgrade></anti-virus></request>"
-                _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
+                check_response = _send_op_command(ip, api_key, ctx, check_cmd, timeout=60)
 
-                LOGGER.info("2/3 Downloading latest Anti-Virus update...")
-                dl_cmd = "<request><anti-virus><upgrade><download><latest/></download></upgrade></anti-virus></request>"
-                dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
-                poll_panorama_job(ip, api_key, ctx, dl_job_id, "Anti-Virus Download")
+                if not _is_already_latest(check_response, "Anti-Virus"):
+                    LOGGER.info("2/3 Downloading latest Anti-Virus update...")
+                    dl_cmd = "<request><anti-virus><upgrade><download><latest/></download></upgrade></anti-virus></request>"
+                    dl_job_id = _send_op_job_command(ip, api_key, ctx, dl_cmd, timeout=30)
+                    poll_panorama_job(ip, api_key, ctx, dl_job_id, "Anti-Virus Download")
 
-                LOGGER.info("3/3 Installing latest Anti-Virus update...")
-                inst_cmd = "<request><anti-virus><upgrade><install><version>latest</version></install></upgrade></anti-virus></request>"
-                inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
-                poll_panorama_job(ip, api_key, ctx, inst_job_id, "Anti-Virus Install")
+                    LOGGER.info("3/3 Installing latest Anti-Virus update...")
+                    inst_cmd = "<request><anti-virus><upgrade><install><version>latest</version></install></upgrade></anti-virus></request>"
+                    inst_job_id = _send_op_job_command(ip, api_key, ctx, inst_cmd, timeout=30)
+                    poll_panorama_job(ip, api_key, ctx, inst_job_id, "Anti-Virus Install")
 
                 state["av_upgraded"] = True
                 save_state(state_file, state)
