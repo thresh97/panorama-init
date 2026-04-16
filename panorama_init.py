@@ -714,6 +714,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     if "committed successfully" in commit_output.lower():
                         LOGGER.info("✅ Initial commit successful.")
                         state["initial_commit_done"] = True
+                        state["_commit_just_ran"] = True
                         save_state(state_file, state)
                     else:
                         LOGGER.error(f"Commit may have failed. Output:\n{commit_output}")
@@ -727,6 +728,13 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
     finally:
         # We can safely close the SSH session before interacting with the API
         ssh.close()
+
+    # The initial commit restarts Panorama's management plane, which briefly
+    # takes the network interface down. Wait before the first API attempt so
+    # we don't burn all retries against a temporarily unreachable host.
+    if state.pop("_commit_just_ran", False):
+        LOGGER.info("Waiting 60s for Panorama management plane to restart after commit...")
+        time.sleep(60)
 
     # --- XML API Interactions ---
 
@@ -806,11 +814,11 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
             LOGGER.info(f"Setting Panorama serial number to '{serial_number}' via XML API...")
 
             command_sent = False
-            for attempt in range(10):
+            for attempt in range(20):
                 try:
                     # Send exactly what the user requested, without pan-os-python auto-wrapping
                     cmd_xml = f"<set><serial-number>{serial_number}</serial-number></set>"
-                    LOGGER.info(f"Sending API command (Attempt {attempt+1}/10)...")
+                    LOGGER.info(f"Sending API command (Attempt {attempt+1}/20)...")
 
                     _send_op_command(ip, api_key, ctx, cmd_xml, timeout=15)
                     command_sent = True
@@ -830,7 +838,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     time.sleep(15)
 
             if not command_sent:
-                raise RuntimeError("Failed to set serial number via XML API after multiple attempts.")
+                raise RuntimeError("Failed to set serial number via XML API after 20 attempts.")
 
             # Now wait for the web server to come back up and verify the serial number
             LOGGER.info("Waiting for Panorama web server to come back up and verifying serial number...")
