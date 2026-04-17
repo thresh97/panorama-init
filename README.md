@@ -188,6 +188,9 @@ export PANORAMA_PASSWORD='YourSecretPassword123!'
 | `--upgrade-panos` | — | Upgrade PAN-OS to a specific version (e.g. `11.2.8`) or `latest` for the newest in the current major.minor family. Triggers a full reboot. |
 | `--plugins` | — | Comma-separated list of plugins to install (e.g. `sw_fw_license-1.2.0,sd_wan-3.3.3-h2`). Skips any already installed. |
 | `--vm-auth-key` | — | Generate a VM Auth Key for firewall bootstrapping. Optionally accepts a lifetime in hours (default: `8760` = 1 year). Omitting the flag skips key generation entirely. |
+| `--configure-ha` | — | Configure Active/Passive HA with the given peer Panorama IP. Both nodes must be provisioned first. The current node becomes the primary (active); the peer becomes secondary (passive). Uses XML API only — no SSH required. |
+| `--connectivity` | `private` | HA peer connectivity: `private` reads each node's private management IP from `show system info` and uses that as the HA peer address (intra-VPC/VNet). `public` uses the passed management IPs directly. |
+| `--ha-peer-state-file` | *(auto-discovered)* | Explicit state file for the HA peer node. Auto-discovered by peer IP if omitted. |
 | `--debug` | `false` | Enable verbose logging, including full XML requests and responses. |
 
 ### Example Invocations
@@ -244,6 +247,21 @@ python3 panorama_init.py \
   --vm-auth-key 4380
 ```
 
+**Configure Active/Passive HA (intra-VPC/VNet — private connectivity):**
+```bash
+# Both nodes must be provisioned first. State files are auto-discovered by IP.
+python3 panorama_init.py 20.119.51.64 --configure-ha 20.119.51.65 --username panadmin
+```
+
+**Configure Active/Passive HA (public IP connectivity):**
+```bash
+python3 panorama_init.py 20.119.51.64 --configure-ha 20.119.51.65 \
+  --username panadmin \
+  --connectivity public
+```
+
+Validated: **Azure Panorama 11.2.8**.
+
 ---
 
 ## State File & Idempotency
@@ -261,7 +279,7 @@ The state file records: IP address, hostname, API password, serial number, conte
 ## Planned / Future Functionality
 
 - **Default credential / forced password change handling:** Automatically detect and handle the `admin/admin` default credential with forced password change on first login, common on hardware appliances and some VM images. This would allow the script to run fully unattended against a fresh out-of-box device with no prior manual steps.
-- **Active/Passive High Availability (HA):** ✅ Implemented via `--configure-ha PEER_IP`. Both nodes must be provisioned first. Uses XML API only — no SSH required for HA setup.
+- **Active/Passive High Availability (HA):** ✅ Implemented via `--configure-ha PEER_IP`. Validated on Azure Panorama 11.2.8. Uses XML API only — no SSH required for HA setup.
 - **Deployment Mode Configuration:** Ability to dynamically set or toggle the Panorama deployment mode between `panorama` mode (management + logging), `management-only` mode, and `log-collector` mode.
 - **Log Collector Setup:** Automated initialization of logging disks, creation of Collector Groups, and assignment of the local Log Collector when running in `panorama` mode.
 
