@@ -272,7 +272,7 @@ python3 panorama_init.py 10.0.0.1 --configure-local-lc --collector-group-name LC
 **Full provisioning + PAN-OS upgrade + plugin + local LC in one invocation:**
 ```bash
 python3 panorama_init.py 10.0.0.1 \
-  --serial-number 000710029872 \
+  --serial-number 000000000000 \
   --upgrade-panos latest \
   --plugins sd_wan-3.3.3-h2 \
   --configure-local-lc \
