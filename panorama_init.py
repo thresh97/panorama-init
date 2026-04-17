@@ -729,13 +729,16 @@ def configure_local_log_collector(
     LOGGER.info("✅ Committed.")
 
     # --- Push config to log collector (type=commit with commit-all cmd) ---
-    # Include the specific log collector serial to force push even when
-    # Panorama reports "no changes to commit" at the group level.
+    # Panorama needs ~30s after the Panorama commit to register the new ring
+    # version internally before commit-all can push it. Without this wait,
+    # commit-all returns "no changes to commit" and the LC stays Out of Sync.
+    LOGGER.info("Waiting 30s for Panorama to register ring version before commit-all...")
+    time.sleep(30)
+
     LOGGER.info(f"Pushing config to log collector group '{collector_group_name}'...")
     push_cmd = (
         f"<commit-all><log-collector-config>"
         f"<log-collector-group>{collector_group_name}</log-collector-group>"
-        f"<log-collector>{serial}</log-collector>"
         f"</log-collector-config></commit-all>"
     )
     data = urllib.parse.urlencode({
