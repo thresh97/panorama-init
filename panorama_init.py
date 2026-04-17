@@ -681,16 +681,35 @@ def configure_local_log_collector(
         poll_panorama_job(ip, api_key, ctx, job_id, "local LC commit")
     LOGGER.info("✅ Committed.")
 
-    # --- Push config to log collector (op command, not type=commit) ---
+    # --- Push config to log collector (type=commit with commit-all cmd) ---
     LOGGER.info(f"Pushing config to log collector group '{collector_group_name}'...")
     push_cmd = (
         f"<commit-all><log-collector-config>"
         f"<log-collector-group>{collector_group_name}</log-collector-group>"
         f"</log-collector-config></commit-all>"
     )
-    push_result = _send_op_command(ip, api_key, ctx, push_cmd, timeout=120)
-    msg = ET.fromstring(push_result).findtext(".//line") or ET.fromstring(push_result).findtext(".//msg") or ""
-    LOGGER.info(f"  {msg.strip()}")
+    data = urllib.parse.urlencode({
+        'type': 'commit',
+        'key':  api_key,
+        'cmd':  push_cmd,
+    }).encode('utf-8')
+    LOGGER.debug(f"Commit-all LC cmd: {push_cmd}")
+    req = urllib.request.Request(f"https://{ip}/api/", data=data)
+    try:
+        res = urllib.request.urlopen(req, context=ctx, timeout=120)
+        body = res.read().decode('utf-8')
+        LOGGER.debug(f"Commit-all LC Response: {body}")
+        root_r = ET.fromstring(body)
+        msg = root_r.findtext(".//line") or root_r.findtext(".//msg") or ""
+        LOGGER.info(f"  {msg.strip()}")
+        # May return a job ID for async push
+        job_elem = root_r.find(".//job")
+        if job_elem is not None:
+            poll_panorama_job(ip, api_key, ctx, job_elem.text, "LC config push")
+    except urllib.error.HTTPError as e:
+        err = e.read().decode('utf-8')
+        LOGGER.debug(f"Commit-all LC HTTP Error: {err}")
+        raise RuntimeError(f"Commit-all LC failed HTTP {e.code}: {err}")
     LOGGER.info("✅ Local log collector configured and active.")
 
 
