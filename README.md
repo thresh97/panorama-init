@@ -299,7 +299,7 @@ The state file records: IP address, hostname, API password, serial number, conte
 
 - **Default credential / forced password change handling:** Automatically detect and handle the `admin/admin` default credential with forced password change on first login, common on hardware appliances and some VM images. This would allow the script to run fully unattended against a fresh out-of-box device with no prior manual steps.
 - **Deployment Mode Configuration:** Ability to dynamically set or toggle the Panorama deployment mode between `panorama` mode (management + logging), `management-only` mode, and `log-collector` mode.
-- **Log Collector Setup:** ✅ Implemented via `--configure-local-lc`. Adds available disks, creates the log-collector config entry and disk-pair assignments, creates a Collector Group, commits, and polls until the LC reports Connected / In Sync. Compound with provisioning args supported in one invocation.
+- **Log Collector Setup:** ✅ Implemented via `--configure-local-lc`. Validated on GCP Panorama 11.2.6. Adds available disks, creates the log-collector config entry and disk-pair assignments, creates a Collector Group, commits, and polls until the LC reports Connected / In Sync. Compound with provisioning args supported in one invocation.
 - **X.Y version targeting for `--upgrade-panos`:** Currently supports exact versions (`11.2.8`) and `latest` (newest patch within the currently-running major.minor). Adding `X.Y` shorthand (e.g. `11.2` → latest 11.2.x) would be useful but gets complicated when Panorama is on a different major.minor family and a stepping upgrade is required.
 
 ---
