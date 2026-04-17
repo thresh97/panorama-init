@@ -1018,11 +1018,11 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
             LOGGER.info(f"Setting Panorama serial number to '{serial_number}' via XML API...")
 
             command_sent = False
-            for attempt in range(20):
+            for attempt in range(30):
                 try:
                     # Send exactly what the user requested, without pan-os-python auto-wrapping
                     cmd_xml = f"<set><serial-number>{serial_number}</serial-number></set>"
-                    LOGGER.info(f"Sending API command (Attempt {attempt+1}/20)...")
+                    LOGGER.info(f"Sending API command (Attempt {attempt+1}/30)...")
 
                     _send_op_command(ip, api_key, ctx, cmd_xml, timeout=15)
                     command_sent = True
@@ -1042,7 +1042,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     time.sleep(15)
 
             if not command_sent:
-                raise RuntimeError("Failed to set serial number via XML API after 20 attempts.")
+                raise RuntimeError("Failed to set serial number via XML API after 30 attempts.")
 
             # Now wait for the web server to come back up and verify the serial number
             LOGGER.info("Waiting for Panorama web server to come back up and verifying serial number...")
@@ -1723,7 +1723,7 @@ def main():
             parser.error("ip is required unless --state-file is provided.")
         ip = args.ip
         state_file_path = _discover_state_file(ip)
-        stored = load_state(state_file_path)
+        stored = load_state(state_file_path) if state_file_path.is_file() else {}
 
     username = args.username or stored.get("username") or "admin"
     if not args.username and stored.get("username"):
