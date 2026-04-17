@@ -261,7 +261,7 @@ The state file records: IP address, hostname, API password, serial number, conte
 ## Planned / Future Functionality
 
 - **Default credential / forced password change handling:** Automatically detect and handle the `admin/admin` default credential with forced password change on first login, common on hardware appliances and some VM images. This would allow the script to run fully unattended against a fresh out-of-box device with no prior manual steps.
-- **Active/Passive High Availability (HA):** Automated configuration of A/P HA peering between two provisioned Panorama nodes.
+- **Active/Passive High Availability (HA):** ✅ Implemented via `--configure-ha PEER_IP`. Both nodes must be provisioned first. Uses XML API only — no SSH required for HA setup.
 - **Deployment Mode Configuration:** Ability to dynamically set or toggle the Panorama deployment mode between `panorama` mode (management + logging), `management-only` mode, and `log-collector` mode.
 - **Log Collector Setup:** Automated initialization of logging disks, creation of Collector Groups, and assignment of the local Log Collector when running in `panorama` mode.
 

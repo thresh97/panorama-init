@@ -321,6 +321,210 @@ def poll_panorama_job(ip, api_key, ctx, job_id, job_name, timeout_mins=20):
     raise RuntimeError(f"Timed out waiting for job {job_id} ({job_name}).")
 
 
+# ---------------------------------------------------------------------------
+# HA SETUP HELPERS
+# ---------------------------------------------------------------------------
+
+def _keygen(ip: str, username: str, password: str, ctx) -> str:
+    """Fetch an XML API key via username/password credentials."""
+    data = urllib.parse.urlencode({
+        'type': 'keygen',
+        'user': username,
+        'password': password,
+    }).encode('utf-8')
+    LOGGER.debug(f"Keygen request for {username}@{ip}")
+    req = urllib.request.Request(f"https://{ip}/api/", data=data)
+    res = urllib.request.urlopen(req, context=ctx, timeout=15)
+    body = res.read().decode('utf-8')
+    LOGGER.debug(f"Keygen response: {body}")
+    key = ET.fromstring(body).findtext('.//key')
+    if not key:
+        raise RuntimeError(f"Keygen failed for {ip}: {body}")
+    return key
+
+
+def _send_config_set(ip: str, api_key: str, ctx, xpath: str, element: str, timeout: int = 30) -> str:
+    """Send a type=config&action=set command via the XML API. Returns raw XML response."""
+    data = urllib.parse.urlencode({
+        'type':    'config',
+        'action':  'set',
+        'key':     api_key,
+        'xpath':   xpath,
+        'element': element,
+    }).encode('utf-8')
+    LOGGER.debug(f"Config Set — xpath: {xpath}  element: {element}")
+    req = urllib.request.Request(f"https://{ip}/api/", data=data)
+    try:
+        res = urllib.request.urlopen(req, context=ctx, timeout=timeout)
+        body = res.read().decode('utf-8')
+        LOGGER.debug(f"Config Set Response: {body}")
+        root = ET.fromstring(body)
+        if root.get('status') != 'success':
+            raise RuntimeError(f"Config set failed: {body}")
+        return body
+    except urllib.error.HTTPError as e:
+        err = e.read().decode('utf-8')
+        LOGGER.debug(f"Config Set HTTP Error: {err}")
+        raise RuntimeError(f"Config set HTTP {e.code}: {err}")
+
+
+def _send_api_commit(ip: str, api_key: str, ctx, timeout: int = 30):
+    """Send a type=commit command via the XML API. Returns job ID or None."""
+    data = urllib.parse.urlencode({
+        'type': 'commit',
+        'key':  api_key,
+        'cmd':  '<commit></commit>',
+    }).encode('utf-8')
+    LOGGER.debug(f"API commit request for {ip}")
+    req = urllib.request.Request(f"https://{ip}/api/", data=data)
+    try:
+        res = urllib.request.urlopen(req, context=ctx, timeout=timeout)
+        body = res.read().decode('utf-8')
+        LOGGER.debug(f"Commit Response: {body}")
+        root = ET.fromstring(body)
+        if root.get('status') != 'success':
+            raise RuntimeError(f"Commit failed: {root.findtext('.//msg') or body}")
+        job_elem = root.find('.//job')
+        return job_elem.text if job_elem is not None else None
+    except urllib.error.HTTPError as e:
+        err = e.read().decode('utf-8')
+        LOGGER.debug(f"Commit HTTP Error: {err}")
+        raise RuntimeError(f"Commit HTTP {e.code}: {err}")
+
+
+def _get_private_ip(ip: str, api_key: str, ctx) -> str:
+    """Return the private management IP of a Panorama node from show system info."""
+    raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=15)
+    private_ip = ET.fromstring(raw).findtext('.//ip-address')
+    if not private_ip or private_ip.lower() == 'unknown':
+        raise RuntimeError(f"Could not determine private management IP for {ip}")
+    return private_ip
+
+
+def _poll_ha_state(ip: str, api_key: str, ctx, expected_state: str, timeout_mins: int = 5):
+    """Poll HA state until the node reports expected_state ('active' or 'passive')."""
+    cmd = "<show><high-availability><state/></high-availability></show>"
+    max_attempts = timeout_mins * 4  # 15s intervals
+    LOGGER.info(f"Polling HA state on {ip} — expecting: {expected_state}")
+    for attempt in range(max_attempts):
+        time.sleep(15)
+        try:
+            raw = _send_op_command(ip, api_key, ctx, cmd, timeout=15)
+            state = ET.fromstring(raw).findtext('.//local-info/state') or \
+                    ET.fromstring(raw).findtext('.//state')
+            LOGGER.info(f"  HA state: {state or 'unknown'} (attempt {attempt + 1}/{max_attempts})")
+            if state and expected_state.lower() in state.lower():
+                return
+        except Exception as exc:
+            LOGGER.debug(f"  HA state poll error: {exc}")
+    raise RuntimeError(
+        f"HA state on {ip} did not reach '{expected_state}' within {timeout_mins} minutes."
+    )
+
+
+def configure_panorama_ha(
+    primary_ip: str,
+    peer_ip: str,
+    username: str,
+    primary_state_file: Path,
+    peer_state_file: Path,
+    connectivity: str = 'private',
+    group_id: int = 1,
+):
+    """
+    Configure Active/Passive HA between two Panorama nodes using the XML API only.
+
+    primary_ip / peer_ip  — management IPs used for API access.
+    connectivity          — 'private': each node peers to the other's private mgmt IP
+                            (read from show system info — no VPN/encryption needed).
+                            'public': uses the passed management IPs as peer-ip.
+    """
+    ctx = _make_ssl_ctx()
+
+    # --- Credentials from state files ---
+    primary_state = load_state(primary_state_file)
+    peer_state    = load_state(peer_state_file)
+
+    primary_password = primary_state.get('api_password')
+    peer_password    = peer_state.get('api_password')
+
+    if not primary_password:
+        raise ValueError(
+            f"No api_password in primary state file {primary_state_file}. "
+            "Run panorama_init.py against the primary first."
+        )
+    if not peer_password:
+        raise ValueError(
+            f"No api_password in peer state file {peer_state_file}. "
+            "Run panorama_init.py against the peer first."
+        )
+
+    # --- API keys ---
+    LOGGER.info(f"Getting API key for primary ({primary_ip})...")
+    primary_key = _keygen(primary_ip, username, primary_password, ctx)
+    LOGGER.info(f"Getting API key for peer ({peer_ip})...")
+    peer_key = _keygen(peer_ip, username, peer_password, ctx)
+
+    # --- Determine peer IPs for HA config ---
+    if connectivity == 'private':
+        LOGGER.info("Reading private management IPs from each node...")
+        primary_ha_ip = _get_private_ip(primary_ip, primary_key, ctx)
+        peer_ha_ip    = _get_private_ip(peer_ip, peer_key, ctx)
+        LOGGER.info(f"  Primary private IP: {primary_ha_ip}")
+        LOGGER.info(f"  Peer private IP:    {peer_ha_ip}")
+    else:
+        primary_ha_ip = primary_ip
+        peer_ha_ip    = peer_ip
+        LOGGER.info(f"Using public IPs for HA peering: {primary_ha_ip} ↔ {peer_ha_ip}")
+
+    # --- HA config xpath (same on both nodes) ---
+    HA_XPATH = (
+        "/config/devices/entry[@name='localhost.localdomain']"
+        "/deviceconfig/high-availability"
+    )
+
+    def _ha_element(priority: str, peer_addr: str) -> str:
+        return (
+            f"<enabled>yes</enabled>"
+            f"<group>"
+            f"<group-id>{group_id}</group-id>"
+            f"<mode><active-passive>"
+            f"<passive-link-state>shutdown</passive-link-state>"
+            f"</active-passive></mode>"
+            f"<election-option><priority>{priority}</priority></election-option>"
+            f"<peer-ip>{peer_addr}</peer-ip>"
+            f"</group>"
+        )
+
+    # --- Configure and commit primary ---
+    LOGGER.info(f"Configuring HA on primary ({primary_ip}) — priority: primary, peer: {peer_ha_ip}")
+    _send_config_set(primary_ip, primary_key, ctx, HA_XPATH, _ha_element('primary', peer_ha_ip))
+
+    LOGGER.info(f"Committing primary ({primary_ip})...")
+    job_id = _send_api_commit(primary_ip, primary_key, ctx)
+    if job_id:
+        poll_panorama_job(primary_ip, primary_key, ctx, job_id, "HA commit (primary)")
+    LOGGER.info("✅ Primary committed.")
+
+    # --- Configure and commit peer ---
+    LOGGER.info(f"Configuring HA on peer ({peer_ip}) — priority: secondary, peer: {primary_ha_ip}")
+    _send_config_set(peer_ip, peer_key, ctx, HA_XPATH, _ha_element('secondary', primary_ha_ip))
+
+    LOGGER.info(f"Committing peer ({peer_ip})...")
+    job_id = _send_api_commit(peer_ip, peer_key, ctx)
+    if job_id:
+        poll_panorama_job(peer_ip, peer_key, ctx, job_id, "HA commit (peer)")
+    LOGGER.info("✅ Peer committed.")
+
+    # --- Verify HA state ---
+    LOGGER.info("Verifying HA state convergence...")
+    _poll_ha_state(primary_ip, primary_key, ctx, 'active')
+    LOGGER.info(f"✅ Primary ({primary_ip}) is active.")
+    _poll_ha_state(peer_ip, peer_key, ctx, 'passive')
+    LOGGER.info(f"✅ Peer ({peer_ip}) is passive.")
+    LOGGER.info("✅ HA pair healthy.")
+
+
 # --- SSH Interaction Class ---
 class PanoramaSSHClient:
     """A wrapper for Paramiko to handle interactive shell sessions with Panorama."""
@@ -1457,6 +1661,34 @@ def main():
         )
     )
     parser.add_argument(
+        "--configure-ha",
+        metavar="PEER_IP",
+        default=None,
+        help=(
+            "Configure Active/Passive HA with the given peer Panorama IP.\n"
+            "Both nodes must have been provisioned with panorama_init.py first\n"
+            "(api_password is read from each node's state file).\n"
+            "The current node becomes the primary (active); PEER_IP becomes secondary (passive)."
+        )
+    )
+    parser.add_argument(
+        "--connectivity",
+        choices=["private", "public"],
+        default="private",
+        help=(
+            "HA peer IP connectivity. 'private' (default): reads each node's private\n"
+            "management IP from show system info and uses that as the HA peer address\n"
+            "(intra-VPC/VNet, no encryption needed). 'public': uses the passed\n"
+            "management IPs directly as the HA peer address."
+        )
+    )
+    parser.add_argument(
+        "--ha-peer-state-file",
+        metavar="PATH",
+        default=None,
+        help="Explicit state file for the HA peer node. Auto-discovered by peer IP if omitted."
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable verbose debug logging (including XML requests/responses)."
@@ -1497,26 +1729,45 @@ def main():
     if not args.username and stored.get("username"):
         LOGGER.info(f"Using username '{username}' from state file.")
 
-    try:
-        provision_panorama(
-            ip=ip,
-            username=username,
-            ssh_key=ssh_key_path,
-            password=panorama_password,
-            state_file=state_file_path,
-            serial_number=args.serial_number,
-            otp=args.otp,
-            csp_api_key=args.csp_api_key,
-            upgrade_content=args.upgrade_content,
-            upgrade_av=args.upgrade_av,
-            upgrade_panos=args.upgrade_panos,
-            plugins=args.plugins,
-            vm_auth_key_hours=args.vm_auth_key_hours,
-            hostname=args.hostname,
-        )
-    except Exception as e:
-        LOGGER.error(f"Provisioning failed: {e}", exc_info=True)
-        sys.exit(1)
+    if args.configure_ha:
+        peer_ip = args.configure_ha
+        if args.ha_peer_state_file:
+            peer_state_file = Path(args.ha_peer_state_file).expanduser().resolve()
+        else:
+            peer_state_file = _discover_state_file(peer_ip)
+        try:
+            configure_panorama_ha(
+                primary_ip=ip,
+                peer_ip=peer_ip,
+                username=username,
+                primary_state_file=state_file_path,
+                peer_state_file=peer_state_file,
+                connectivity=args.connectivity,
+            )
+        except Exception as e:
+            LOGGER.error(f"HA configuration failed: {e}", exc_info=True)
+            sys.exit(1)
+    else:
+        try:
+            provision_panorama(
+                ip=ip,
+                username=username,
+                ssh_key=ssh_key_path,
+                password=panorama_password,
+                state_file=state_file_path,
+                serial_number=args.serial_number,
+                otp=args.otp,
+                csp_api_key=args.csp_api_key,
+                upgrade_content=args.upgrade_content,
+                upgrade_av=args.upgrade_av,
+                upgrade_panos=args.upgrade_panos,
+                plugins=args.plugins,
+                vm_auth_key_hours=args.vm_auth_key_hours,
+                hostname=args.hostname,
+            )
+        except Exception as e:
+            LOGGER.error(f"Provisioning failed: {e}", exc_info=True)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
