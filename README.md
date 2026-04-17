@@ -1,6 +1,6 @@
 # Panorama Initial Provisioning CLI
 
-> **This script does not deploy Panorama.** It assumes Panorama is already running and reachable at the IP address you provide — fresh from factory defaults, with the admin account accessible via SSH.
+> **This script does not deploy Panorama.** It assumes Panorama is already running and reachable at the IP address you provide — fresh from factory defaults, with the admin account accessible via SSH. To deploy Panorama infrastructure first, see [panorama-create](https://github.com/thresh97/panorama-create).
 
 A Python CLI tool for idempotently bootstrapping and provisioning a freshly deployed, factory-default Palo Alto Networks Panorama instance. It works with any supported Panorama form factor: hardware appliances, software VMs on public cloud (Azure, AWS, GCP), and software VMs on private cloud or on-premises hypervisors.
 
