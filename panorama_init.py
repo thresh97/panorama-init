@@ -538,19 +538,32 @@ def _poll_lc_sync(ip: str, api_key: str, ctx, serial: str,
         time.sleep(15)
         try:
             raw = _send_op_command(ip, api_key, ctx, cmd, timeout=15)
-            text = "".join(ET.fromstring(raw).itertext())
-            for line in text.splitlines():
-                if serial in line:
-                    connected = "yes" in line.lower()
-                    in_sync   = "in sync" in line.lower()
-                    LOGGER.info(
-                        f"  LC {serial}: connected={connected} "
-                        f"config_status={'In Sync' if in_sync else 'Out of Sync'} "
-                        f"(attempt {attempt + 1}/{max_attempts})"
-                    )
-                    if connected and in_sync:
-                        return
-                    break
+            root = ET.fromstring(raw)
+            # Response may be XML-structured or plain-text depending on version.
+            # Try XML path first (11.2.x returns structured XML).
+            lc_entry = root.find(f".//log-collector/entry[@name='{serial}']")
+            if lc_entry is not None:
+                connected   = lc_entry.findtext("connected", "").strip().lower() == "yes"
+                config_stat = lc_entry.findtext("config-status", "").strip()
+                in_sync     = config_stat.lower() == "in sync"
+            else:
+                # Fall back to plain-text line parsing
+                text = "".join(root.itertext())
+                connected = in_sync = False
+                for line in text.splitlines():
+                    if serial in line:
+                        connected = "yes" in line.lower()
+                        in_sync   = "in sync" in line.lower()
+                        config_stat = "In Sync" if in_sync else "Out of Sync"
+                        break
+
+            LOGGER.info(
+                f"  LC {serial}: connected={connected} "
+                f"config_status={config_stat} "
+                f"(attempt {attempt + 1}/{max_attempts})"
+            )
+            if connected and in_sync:
+                return
         except Exception as exc:
             LOGGER.debug(f"  LC sync poll error: {exc}")
     raise RuntimeError(
@@ -716,10 +729,13 @@ def configure_local_log_collector(
     LOGGER.info("✅ Committed.")
 
     # --- Push config to log collector (type=commit with commit-all cmd) ---
+    # Include the specific log collector serial to force push even when
+    # Panorama reports "no changes to commit" at the group level.
     LOGGER.info(f"Pushing config to log collector group '{collector_group_name}'...")
     push_cmd = (
         f"<commit-all><log-collector-config>"
         f"<log-collector-group>{collector_group_name}</log-collector-group>"
+        f"<log-collector>{serial}</log-collector>"
         f"</log-collector-config></commit-all>"
     )
     data = urllib.parse.urlencode({
@@ -744,7 +760,7 @@ def configure_local_log_collector(
         err = e.read().decode('utf-8')
         LOGGER.debug(f"Commit-all LC HTTP Error: {err}")
         raise RuntimeError(f"Commit-all LC failed HTTP {e.code}: {err}")
-    _poll_lc_sync(ip, api_key, ctx, serial, collector_group_name)
+    _poll_lc_sync(ip, api_key, ctx, serial, collector_group_name, timeout_mins=10)
     LOGGER.info("✅ Local log collector configured and In Sync.")
 
 
