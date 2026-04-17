@@ -580,9 +580,21 @@ def configure_local_log_collector(
 
     capacity = int(root.findtext(".//licensed-device-capacity") or "0")
     if capacity == 0:
+        LOGGER.info("No license detected — fetching license from Palo Alto licensing server...")
+        try:
+            _send_op_command(ip, api_key, ctx,
+                             "<request><license><fetch/></license></request>", timeout=60)
+            LOGGER.info("License fetch complete. Re-checking capacity...")
+            raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=15)
+            root = ET.fromstring(raw)
+            capacity = int(root.findtext(".//licensed-device-capacity") or "0")
+        except Exception as exc:
+            LOGGER.warning(f"License fetch failed: {exc}")
+
+    if capacity == 0:
         raise RuntimeError(
             "Panorama is not licensed (licensed-device-capacity=0). "
-            "Apply a license before configuring the local log collector."
+            "Ensure the serial number is set and the instance has internet access to the licensing server."
         )
 
     serial = root.findtext(".//serial")
