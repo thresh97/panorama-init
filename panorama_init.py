@@ -609,10 +609,16 @@ def configure_local_log_collector(
         "<show><system><disk><details/></disk></system></show>",
         timeout=15,
     )
-    # Parse plain-text CDATA: look for "Name   : sdb" / "Status : Available" blocks
+    # Response is plain-text in either <result> (CDATA) or <result><member> depending on version.
+    disk_root = ET.fromstring(disk_raw)
+    disk_text = (
+        disk_root.findtext(".//result") or
+        disk_root.findtext(".//member") or
+        ""
+    )
     available_disks = []
     current = {}
-    for line in ET.fromstring(disk_raw).findtext(".//result", "").splitlines():
+    for line in disk_text.splitlines():
         line = line.strip()
         if line.startswith("Name"):
             current = {"name": line.split(":", 1)[-1].strip()}
