@@ -429,7 +429,6 @@ def configure_panorama_ha(
     primary_state_file: Path,
     peer_state_file: Path,
     connectivity: str = 'private',
-    group_id: int = 1,
 ):
     """
     Configure Active/Passive HA between two Panorama nodes using the XML API only.
@@ -477,28 +476,29 @@ def configure_panorama_ha(
         peer_ha_ip    = peer_ip
         LOGGER.info(f"Using public IPs for HA peering: {primary_ha_ip} ↔ {peer_ha_ip}")
 
-    # --- HA config xpath (same on both nodes) ---
-    HA_XPATH = (
-        "/config/devices/entry[@name='localhost.localdomain']"
-        "/deviceconfig/high-availability"
-    )
+    # --- HA config xpaths (confirmed from debug cli output) ---
+    BASE   = "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/high-availability"
+    ELECT  = BASE + "/election-option"
+    TIMERS = ELECT + "/timers"
+    PEER   = BASE + "/peer"
 
-    def _ha_element(priority: str, peer_addr: str) -> str:
-        return (
-            f"<enabled>yes</enabled>"
-            f"<group>"
-            f"<group-id>{group_id}</group-id>"
-            f"<mode><active-passive>"
-            f"<passive-link-state>shutdown</passive-link-state>"
-            f"</active-passive></mode>"
-            f"<election-option><priority>{priority}</priority></election-option>"
-            f"<peer-ip>{peer_addr}</peer-ip>"
-            f"</group>"
-        )
+    def _peer_element(peer_addr: str) -> str:
+        if connectivity == 'public':
+            return (
+                f"<ip-address>{peer_addr}</ip-address>"
+                f"<encryption><enabled>yes</enabled></encryption>"
+            )
+        return f"<ip-address>{peer_addr}</ip-address>"
+
+    def _configure_node(mgmt_ip: str, key: str, priority: str, peer_addr: str):
+        LOGGER.info(f"Configuring HA on {mgmt_ip} — priority: {priority}, peer: {peer_addr}")
+        _send_config_set(mgmt_ip, key, ctx, BASE,   "<enabled>yes</enabled>")
+        _send_config_set(mgmt_ip, key, ctx, ELECT,  f"<priority>{priority}</priority>")
+        _send_config_set(mgmt_ip, key, ctx, TIMERS, "<recommended/>")
+        _send_config_set(mgmt_ip, key, ctx, PEER,   _peer_element(peer_addr))
 
     # --- Configure and commit primary ---
-    LOGGER.info(f"Configuring HA on primary ({primary_ip}) — priority: primary, peer: {peer_ha_ip}")
-    _send_config_set(primary_ip, primary_key, ctx, HA_XPATH, _ha_element('primary', peer_ha_ip))
+    _configure_node(primary_ip, primary_key, 'primary', peer_ha_ip)
 
     LOGGER.info(f"Committing primary ({primary_ip})...")
     job_id = _send_api_commit(primary_ip, primary_key, ctx)
@@ -507,8 +507,7 @@ def configure_panorama_ha(
     LOGGER.info("✅ Primary committed.")
 
     # --- Configure and commit peer ---
-    LOGGER.info(f"Configuring HA on peer ({peer_ip}) — priority: secondary, peer: {primary_ha_ip}")
-    _send_config_set(peer_ip, peer_key, ctx, HA_XPATH, _ha_element('secondary', primary_ha_ip))
+    _configure_node(peer_ip, peer_key, 'secondary', primary_ha_ip)
 
     LOGGER.info(f"Committing peer ({peer_ip})...")
     job_id = _send_api_commit(peer_ip, peer_key, ctx)
