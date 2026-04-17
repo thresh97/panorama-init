@@ -987,7 +987,8 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                        serial_number: str = None, otp: str = None, csp_api_key: str = None,
                        upgrade_content: bool = False, upgrade_av: bool = False,
                        upgrade_panos: str = None, plugins: str = None,
-                       vm_auth_key_hours: int = None, hostname: str = None):
+                       vm_auth_key_hours: int = None, hostname: str = None,
+                       public_ip: str = None):
     """Executes the idempotent provisioning sequence on Panorama."""
     state = load_state(state_file)
     _commit_just_ran = False  # local flag, never persisted to state file
@@ -1036,6 +1037,25 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
 
                 # Check whether the target hostname is already configured.
                 _sysinfo = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=10)
+
+                # Warn if connecting via a NAT/public IP but public-ip-address is not set.
+                # NGFWs bootstrapping to Panorama via a public NAT address need Panorama to
+                # advertise that address — set it with --public-ip <public-ip>.
+                if not public_ip:
+                    import xml.etree.ElementTree as _ET
+                    _si = _ET.fromstring(_sysinfo)
+                    _private_ip = (_si.findtext(".//ip-address") or "").strip()
+                    _pub = (_si.findtext(".//public-ip-address") or "unknown").strip()
+                    _via_nat = _private_ip and ip != _private_ip
+                    if _via_nat and _pub.lower() in ("unknown", ""):
+                        LOGGER.warning(
+                            f"Connecting via {ip} but Panorama's private IP is {_private_ip} — "
+                            "you appear to be going through NAT. "
+                            "public-ip-address is not configured: managed firewalls will not be "
+                            "able to bootstrap to Panorama via this public address. "
+                            f"Pass --public-ip {ip} to configure it."
+                        )
+
                 _target_hostname = hostname or "Panorama-Management"
                 if f"<hostname>{_target_hostname}</hostname>" in _sysinfo:
                     state["hostname_set"] = True
@@ -1129,6 +1149,21 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 LOGGER.info("✅ Hostname configured.")
             else:
                 LOGGER.info("⏭️  Skipping hostname configuration (already complete).")
+
+            # Step 3b: Set public management IP (optional)
+            if public_ip:
+                if state.get("public_ip_set") and state.get("public_ip") == public_ip:
+                    LOGGER.info(f"⏭️  Public IP '{public_ip}' already configured. Skipping.")
+                else:
+                    LOGGER.info(f"Setting public-ip-address to '{public_ip}'...")
+                    ssh.send_command(
+                        f"set deviceconfig system public-ip-address {public_ip}",
+                        prompt_chars=['#'],
+                    )
+                    state["public_ip_set"] = True
+                    state["public_ip"] = public_ip
+                    save_state(state_file, state)
+                    LOGGER.info("✅ Public IP configured.")
 
             # Step 4: Commit Configuration
             if not state.get("initial_commit_done"):
@@ -1827,6 +1862,17 @@ def main():
         help="Hostname to set on the Panorama VM (default: Panorama-Management)."
     )
     parser.add_argument(
+        "--public-ip",
+        metavar="IP",
+        default=None,
+        help=(
+            "Set the public management IP address on Panorama "
+            "(deviceconfig system public-ip-address). Only applied when the "
+            "value differs from what is already configured. Warns if the value "
+            "matches the management IP used to connect."
+        )
+    )
+    parser.add_argument(
         "--username",
         default=None,
         help="The SSH/API username. Defaults to value stored in state file, or 'admin' if not found."
@@ -2037,6 +2083,7 @@ def main():
                     plugins=args.plugins,
                     vm_auth_key_hours=args.vm_auth_key_hours,
                     hostname=args.hostname,
+                    public_ip=args.public_ip,
                 )
             except Exception as e:
                 LOGGER.error(f"Provisioning failed: {e}", exc_info=True)
