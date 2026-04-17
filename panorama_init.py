@@ -609,13 +609,10 @@ def configure_local_log_collector(
         "<show><system><disk><details/></disk></system></show>",
         timeout=15,
     )
-    # Response is plain-text in either <result> (CDATA) or <result><member> depending on version.
+    # Response is plain-text in either <result> CDATA or <result><member> depending on version.
+    # Use itertext() to collect all text content regardless of nesting.
     disk_root = ET.fromstring(disk_raw)
-    disk_text = (
-        disk_root.findtext(".//result") or
-        disk_root.findtext(".//member") or
-        ""
-    )
+    disk_text = "".join(disk_root.itertext())
     available_disks = []
     current = {}
     for line in disk_text.splitlines():
