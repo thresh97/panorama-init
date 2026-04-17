@@ -579,6 +579,7 @@ def configure_local_log_collector(
     username: str,
     state_file: Path,
     collector_group_name: str = "default",
+    ssh_key_path: Path = None,
 ):
     """
     Configure the local log collector on a Panorama instance running in
@@ -731,18 +732,12 @@ def configure_local_log_collector(
     LOGGER.info("✅ Committed.")
 
     # --- Push config to log collector (type=commit with commit-all cmd) ---
-    # Panorama needs ~30s after the Panorama commit to register the new ring
-    # version internally before commit-all can push it. Without this wait,
-    # commit-all returns "no changes to commit" and the LC stays Out of Sync.
-    LOGGER.info("Waiting 30s for Panorama to register ring version before commit-all...")
-    time.sleep(30)
-
     # commit-all log-collector-config is blocked at the XML API layer (HTTP 400
     # for both type=op and type=commit). Use SSH/CLI — the same path the UI uses.
-    # api_password from state is the SSH password (set by provision_panorama).
+    # Try the provided SSH key first; fall back to api_password from state.
     LOGGER.info(f"Pushing config to log collector group '{collector_group_name}' via SSH...")
     try:
-        ssh = PanoramaSSHClient(ip, username, ssh_key_path=None, password=api_password)
+        ssh = PanoramaSSHClient(ip, username, ssh_key_path=ssh_key_path, password=api_password)
         ssh.connect(max_retries=5, delay=10)
         result = ssh.send_command(
             f"commit-all log-collector-config log-collector-group {collector_group_name}",
@@ -2054,6 +2049,7 @@ def main():
                     username=username,
                     state_file=state_file_path,
                     collector_group_name=args.collector_group_name,
+                    ssh_key_path=ssh_key_path,
                 )
             except Exception as e:
                 LOGGER.error(f"Local log collector configuration failed: {e}", exc_info=True)
