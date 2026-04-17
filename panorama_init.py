@@ -737,34 +737,29 @@ def configure_local_log_collector(
     LOGGER.info("Waiting 30s for Panorama to register ring version before commit-all...")
     time.sleep(30)
 
+    # commit-all log-collector-config must be sent as type=op — the CLI debug
+    # confirms this is how Panorama executes it. type=commit sees "no changes"
+    # because it only checks pending config diffs, not ring version propagation.
     LOGGER.info(f"Pushing config to log collector group '{collector_group_name}'...")
     push_cmd = (
         f"<commit-all><log-collector-config>"
         f"<log-collector-group>{collector_group_name}</log-collector-group>"
         f"</log-collector-config></commit-all>"
     )
-    data = urllib.parse.urlencode({
-        'type': 'commit',
-        'key':  api_key,
-        'cmd':  push_cmd,
-    }).encode('utf-8')
-    LOGGER.debug(f"Commit-all LC cmd: {push_cmd}")
-    req = urllib.request.Request(f"https://{ip}/api/", data=data)
+    LOGGER.debug(f"Commit-all LC cmd (type=op): {push_cmd}")
     try:
-        res = urllib.request.urlopen(req, context=ctx, timeout=120)
-        body = res.read().decode('utf-8')
+        body = _send_op_command(ip, api_key, ctx, push_cmd, timeout=120)
         LOGGER.debug(f"Commit-all LC Response: {body}")
         root_r = ET.fromstring(body)
         msg = root_r.findtext(".//line") or root_r.findtext(".//msg") or ""
         LOGGER.info(f"  {msg.strip()}")
-        # May return a job ID for async push
         job_elem = root_r.find(".//job")
         if job_elem is not None:
             poll_panorama_job(ip, api_key, ctx, job_elem.text, "LC config push")
-    except urllib.error.HTTPError as e:
-        err = e.read().decode('utf-8')
-        LOGGER.debug(f"Commit-all LC HTTP Error: {err}")
-        raise RuntimeError(f"Commit-all LC failed HTTP {e.code}: {err}")
+    except RuntimeError as e:
+        # Log but don't abort — Panorama may still self-sync via ring version
+        # propagation. The poll loop below will detect success either way.
+        LOGGER.warning(f"commit-all log-collector-config failed: {e} — polling for self-sync")
     _poll_lc_sync(ip, api_key, ctx, serial, collector_group_name, timeout_mins=10)
     LOGGER.info("✅ Local log collector configured and In Sync.")
 
