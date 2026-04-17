@@ -909,6 +909,10 @@ def _resolve_panos_target_version(ip, api_key, ctx, requested_version):
     current_version = _get_current_panos_version(ip, api_key, ctx)
     LOGGER.info(f"Current PAN-OS version: {current_version}")
 
+    # TODO: Add X.Y shorthand (e.g. '--upgrade-panos 11.2' → latest 11.2.x patch).
+    # Complication: if Panorama is on 11.1.x and 11.2 is requested, a stepping upgrade
+    # through an intermediate version may be required before reaching 11.2. For now,
+    # exact version (11.2.8) and 'latest' (newest patch in current family) are supported.
     if requested_version.lower() != "latest":
         # Fix #7: Warn explicitly when the requested version is in a different major.minor
         # family, since PAN-OS requires stepping through intermediate versions for major jumps.

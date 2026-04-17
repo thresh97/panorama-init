@@ -191,6 +191,8 @@ export PANORAMA_PASSWORD='YourSecretPassword123!'
 | `--configure-ha` | — | Configure Active/Passive HA with the given peer Panorama IP. Both nodes must be provisioned first. The current node becomes the primary (active); the peer becomes secondary (passive). Uses XML API only — no SSH required. |
 | `--connectivity` | `private` | HA peer connectivity: `private` reads each node's private management IP from `show system info` and uses that as the HA peer address (intra-VPC/VNet). `public` uses the passed management IPs directly. |
 | `--ha-peer-state-file` | *(auto-discovered)* | Explicit state file for the HA peer node. Auto-discovered by peer IP if omitted. |
+| `--configure-local-lc` | — | Configure the local log collector on a Panorama instance in panorama-mode. Requires: license applied, panorama-mode, at least one attached log disk. Can be combined with provisioning args in one invocation — provisioning runs first, then LC setup. |
+| `--collector-group-name` | `default` | Collector group name for `--configure-local-lc`. |
 | `--debug` | `false` | Enable verbose logging, including full XML requests and responses. |
 
 ### Example Invocations
@@ -262,6 +264,23 @@ python3 panorama_init.py 20.119.51.64 --configure-ha 20.119.51.65 \
 
 Validated: **Azure Panorama 11.2.8**.
 
+**Configure local log collector (panorama-mode, disk attached):**
+```bash
+python3 panorama_init.py 10.0.0.1 --configure-local-lc --collector-group-name LCG_default
+```
+
+**Full provisioning + PAN-OS upgrade + plugin + local LC in one invocation:**
+```bash
+python3 panorama_init.py 10.0.0.1 \
+  --serial-number 000710029872 \
+  --upgrade-panos latest \
+  --plugins sd_wan-3.3.3-h2 \
+  --configure-local-lc \
+  --collector-group-name LCG_default
+```
+
+Sequence: set serial → fetch license → upgrade PAN-OS to latest in current family → configure local LC and collector group → poll until In Sync. All steps are idempotent — safe to re-run if interrupted at any point.
+
 ---
 
 ## State File & Idempotency
@@ -280,7 +299,8 @@ The state file records: IP address, hostname, API password, serial number, conte
 
 - **Default credential / forced password change handling:** Automatically detect and handle the `admin/admin` default credential with forced password change on first login, common on hardware appliances and some VM images. This would allow the script to run fully unattended against a fresh out-of-box device with no prior manual steps.
 - **Deployment Mode Configuration:** Ability to dynamically set or toggle the Panorama deployment mode between `panorama` mode (management + logging), `management-only` mode, and `log-collector` mode.
-- **Log Collector Setup:** Automated initialization of logging disks, creation of Collector Groups, and assignment of the local Log Collector when running in `panorama` mode.
+- **Log Collector Setup:** ✅ Implemented via `--configure-local-lc`. Adds available disks, creates the log-collector config entry and disk-pair assignments, creates a Collector Group, commits, and polls until the LC reports Connected / In Sync. Compound with provisioning args supported in one invocation.
+- **X.Y version targeting for `--upgrade-panos`:** Currently supports exact versions (`11.2.8`) and `latest` (newest patch within the currently-running major.minor). Adding `X.Y` shorthand (e.g. `11.2` → latest 11.2.x) would be useful but gets complicated when Panorama is on a different major.minor family and a stepping upgrade is required.
 
 ---
 
