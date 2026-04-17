@@ -595,6 +595,7 @@ def configure_local_log_collector(
     state_file: Path,
     collector_group_name: str = "default",
     ssh_key_path: Path = None,
+    public_ip: str = None,
 ):
     """
     Configure the local log collector on a Panorama instance running in
@@ -711,7 +712,7 @@ def configure_local_log_collector(
         except Exception as exc:
             LOGGER.warning(f"  {disk}: {exc} (continuing)")
 
-    # --- Configure log-collector entry and assign disk pairs ---
+    # --- Configure log-collector entry, disk pairs, and optional public IP ---
     BASE = "/config/devices/entry[@name='localhost.localdomain']"
     LOGGER.info(f"Creating log-collector entry for serial {serial}...")
     _send_config_set(
@@ -729,6 +730,16 @@ def configure_local_log_collector(
             ip, api_key, ctx,
             f"{BASE}/log-collector/entry[@name='{serial}']/disk-settings/disk-pair",
             f"<entry name='{pair_name}'/>",
+        )
+
+    # Set public IP on the LC if provided — required for commit-all to reach
+    # the LC when Panorama is behind NAT.
+    if public_ip:
+        LOGGER.info(f"Setting public-ip-address {public_ip} on log collector {serial}...")
+        _send_config_set(
+            ip, api_key, ctx,
+            f"{BASE}/log-collector/entry[@name='{serial}']/deviceconfig/system",
+            f"<public-ip-address>{public_ip}</public-ip-address>",
         )
 
     # --- Configure collector group ---
@@ -1166,30 +1177,18 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 LOGGER.info("⏭️  Skipping hostname configuration (already complete).")
 
             # Step 3b: Set public management IP (optional)
-            # Resolve --public-ip: '_auto_' means use the connecting IP.
-            _resolved_public_ip = None
-            if public_ip == "_auto_":
-                if _is_rfc1918(ip):
-                    LOGGER.warning(
-                        f"--public-ip with no value requires a non-RFC1918 connecting IP "
-                        f"({ip} is private). Pass --public-ip <public-ip> explicitly."
-                    )
+            # public_ip is already resolved by main() — no _auto_ sentinel here.
+            if public_ip:
+                if state.get("public_ip_set") and state.get("public_ip") == public_ip:
+                    LOGGER.info(f"⏭️  Public IP '{public_ip}' already configured. Skipping.")
                 else:
-                    _resolved_public_ip = ip
-                    LOGGER.info(f"--public-ip: using connecting IP {ip} as public-ip-address.")
-            elif public_ip:
-                _resolved_public_ip = public_ip
-
-            if _resolved_public_ip:
-                if state.get("public_ip_set") and state.get("public_ip") == _resolved_public_ip:
-                    LOGGER.info(f"⏭️  Public IP '{_resolved_public_ip}' already configured. Skipping.")
-                else:
+                    LOGGER.info(f"Setting public-ip-address to '{public_ip}'...")
                     ssh.send_command(
-                        f"set deviceconfig system public-ip-address {_resolved_public_ip}",
+                        f"set deviceconfig system public-ip-address {public_ip}",
                         prompt_chars=['#'],
                     )
                     state["public_ip_set"] = True
-                    state["public_ip"] = _resolved_public_ip
+                    state["public_ip"] = public_ip
                     save_state(state_file, state)
                     LOGGER.info("✅ Public IP configured.")
 
@@ -2070,6 +2069,20 @@ def main():
     if not args.username and stored.get("username"):
         LOGGER.info(f"Using username '{username}' from state file.")
 
+    # Resolve --public-ip early so the value is available to both provision_panorama
+    # and configure_local_log_collector without duplicating the RFC1918 logic.
+    resolved_public_ip = None
+    if args.public_ip == "_auto_":
+        if not _is_rfc1918(ip):
+            resolved_public_ip = ip
+        else:
+            LOGGER.warning(
+                f"--public-ip with no value requires a non-RFC1918 connecting IP "
+                f"({ip} is private). Pass --public-ip <public-ip> explicitly."
+            )
+    elif args.public_ip:
+        resolved_public_ip = args.public_ip
+
     # --configure-ha is mutually exclusive with provisioning (operates on two nodes).
     # --configure-local-lc can run standalone or sequentially after provision_panorama
     # in the same invocation when combined with provisioning args like --serial-number.
@@ -2115,7 +2128,7 @@ def main():
                     plugins=args.plugins,
                     vm_auth_key_hours=args.vm_auth_key_hours,
                     hostname=args.hostname,
-                    public_ip=args.public_ip,
+                    public_ip=resolved_public_ip,
                 )
             except Exception as e:
                 LOGGER.error(f"Provisioning failed: {e}", exc_info=True)
@@ -2129,6 +2142,7 @@ def main():
                     state_file=state_file_path,
                     collector_group_name=args.collector_group_name,
                     ssh_key_path=ssh_key_path,
+                    public_ip=resolved_public_ip,
                 )
             except Exception as e:
                 LOGGER.error(f"Local log collector configuration failed: {e}", exc_info=True)
