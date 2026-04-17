@@ -516,12 +516,167 @@ def configure_panorama_ha(
     LOGGER.info("✅ Peer committed.")
 
     # --- Verify HA state ---
+
     LOGGER.info("Verifying HA state convergence...")
     _poll_ha_state(primary_ip, primary_key, ctx, 'active')
     LOGGER.info(f"✅ Primary ({primary_ip}) is active.")
     _poll_ha_state(peer_ip, peer_key, ctx, 'passive')
     LOGGER.info(f"✅ Peer ({peer_ip}) is passive.")
     LOGGER.info("✅ HA pair healthy.")
+
+
+def configure_local_log_collector(
+    ip: str,
+    username: str,
+    state_file: Path,
+    collector_group_name: str = "default",
+):
+    """
+    Configure the local log collector on a Panorama instance running in
+    panorama-mode (combined management + logging). Uses XML API only.
+
+    Prerequisites verified before proceeding:
+      - system-mode == 'panorama'
+      - licensed-device-capacity > 0 (license applied)
+      - at least one disk in Available state
+
+    Steps:
+      1. Add available disks to the system via op command.
+      2. Create the log-collector config entry using Panorama's serial number.
+      3. Create a collector group containing the local log collector.
+      4. Commit.
+      5. Push config to the log collector via commit-all log-collector-config.
+
+    Note: After the commit, Panorama will warn "No disks enabled on log
+    collector" in the commit output. The disk is added at the system level
+    (step 1) but the config layer also requires disk assignment (a separate
+    step requiring additional debug CLI output to confirm the xpath). The
+    log collector will function, logging to the default panlogs partition
+    until disk assignment is configured.
+    """
+    ctx = _make_ssl_ctx()
+
+    state = load_state(state_file)
+    api_password = state.get("api_password")
+    if not api_password:
+        raise ValueError(
+            f"No api_password in state file {state_file}. Run panorama_init.py first."
+        )
+
+    LOGGER.info(f"Getting API key for {ip}...")
+    api_key = _keygen(ip, username, api_password, ctx)
+
+    # --- Verify prerequisites ---
+    LOGGER.info("Verifying prerequisites (system-mode, license, disks)...")
+    raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=15)
+    root = ET.fromstring(raw)
+
+    system_mode = root.findtext(".//system-mode") or ""
+    if system_mode.lower() != "panorama":
+        raise RuntimeError(
+            f"Panorama is not in panorama-mode (system-mode={system_mode!r}). "
+            "Local log collector configuration requires panorama-mode."
+        )
+
+    capacity = int(root.findtext(".//licensed-device-capacity") or "0")
+    if capacity == 0:
+        raise RuntimeError(
+            "Panorama is not licensed (licensed-device-capacity=0). "
+            "Apply a license before configuring the local log collector."
+        )
+
+    serial = root.findtext(".//serial")
+    if not serial or serial.strip().lower() == "unknown":
+        raise RuntimeError("Panorama serial number is unknown. Apply serial before configuring log collector.")
+    serial = serial.strip()
+    LOGGER.info(f"  system-mode: panorama  serial: {serial}  capacity: {capacity}")
+
+    # --- Discover and add disks ---
+    disk_raw = _send_op_command(
+        ip, api_key, ctx,
+        "<show><system><disk><details/></disk></system></show>",
+        timeout=15,
+    )
+    # Parse plain-text CDATA: look for "Name   : sdb" / "Status : Available" blocks
+    available_disks = []
+    current = {}
+    for line in ET.fromstring(disk_raw).findtext(".//result", "").splitlines():
+        line = line.strip()
+        if line.startswith("Name"):
+            current = {"name": line.split(":", 1)[-1].strip()}
+        elif line.startswith("State") and current:
+            current["state"] = line.split(":", 1)[-1].strip()
+        elif line.startswith("Status") and current:
+            current["status"] = line.split(":", 1)[-1].strip()
+            if current.get("state") == "Present" and current.get("status") == "Available":
+                available_disks.append(current["name"])
+            current = {}
+
+    if not available_disks:
+        raise RuntimeError(
+            "No disks in 'Present/Available' state found. Attach log disks before configuring the local log collector."
+        )
+    LOGGER.info(f"Available disks: {available_disks}")
+
+    for disk in available_disks:
+        LOGGER.info(f"Adding disk {disk} to system...")
+        try:
+            result = _send_op_command(
+                ip, api_key, ctx,
+                f"<request><system><disk><add>{disk}</add></disk></system></request>",
+                timeout=60,
+            )
+            msg = ET.fromstring(result).findtext(".//result") or ""
+            LOGGER.info(f"  {disk}: {msg.strip()}")
+        except Exception as exc:
+            LOGGER.warning(f"  {disk}: {exc} (continuing)")
+
+    # --- Configure log-collector entry and assign disk pairs ---
+    BASE = "/config/devices/entry[@name='localhost.localdomain']"
+    LOGGER.info(f"Creating log-collector entry for serial {serial}...")
+    _send_config_set(
+        ip, api_key, ctx,
+        f"{BASE}/log-collector",
+        f"<entry name='{serial}'/>",
+    )
+
+    # Assign each available disk as a disk-pair (A, B, C...).
+    # Panorama auto-maps pair names to physical disks in order.
+    for i, disk in enumerate(available_disks):
+        pair_name = chr(ord('A') + i)
+        LOGGER.info(f"Assigning disk {disk} as disk-pair {pair_name} on log collector...")
+        _send_config_set(
+            ip, api_key, ctx,
+            f"{BASE}/log-collector/entry[@name='{serial}']/disk-settings/disk-pair",
+            f"<entry name='{pair_name}'/>",
+        )
+
+    # --- Configure collector group ---
+    LOGGER.info(f"Creating collector group '{collector_group_name}' with local log collector...")
+    _send_config_set(
+        ip, api_key, ctx,
+        f"{BASE}/log-collector-group/entry[@name='{collector_group_name}']/logfwd-setting/collectors",
+        f"<member>{serial}</member>",
+    )
+
+    # --- Commit ---
+    LOGGER.info("Committing log collector configuration...")
+    job_id = _send_api_commit(ip, api_key, ctx)
+    if job_id:
+        poll_panorama_job(ip, api_key, ctx, job_id, "local LC commit")
+    LOGGER.info("✅ Committed.")
+
+    # --- Push config to log collector (op command, not type=commit) ---
+    LOGGER.info(f"Pushing config to log collector group '{collector_group_name}'...")
+    push_cmd = (
+        f"<commit-all><log-collector-config>"
+        f"<log-collector-group>{collector_group_name}</log-collector-group>"
+        f"</log-collector-config></commit-all>"
+    )
+    push_result = _send_op_command(ip, api_key, ctx, push_cmd, timeout=120)
+    msg = ET.fromstring(push_result).findtext(".//line") or ET.fromstring(push_result).findtext(".//msg") or ""
+    LOGGER.info(f"  {msg.strip()}")
+    LOGGER.info("✅ Local log collector configured and active.")
 
 
 # --- SSH Interaction Class ---
@@ -1706,6 +1861,21 @@ def main():
         help="Explicit state file for the HA peer node. Auto-discovered by peer IP if omitted."
     )
     parser.add_argument(
+        "--configure-local-lc",
+        action="store_true",
+        help=(
+            "Configure the local log collector on a Panorama instance running in panorama-mode.\n"
+            "Requires: license applied, panorama-mode, at least one attached log disk.\n"
+            "See also: --collector-group-name"
+        )
+    )
+    parser.add_argument(
+        "--collector-group-name",
+        metavar="NAME",
+        default="default",
+        help="Collector group name for --configure-local-lc (default: 'default')"
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable verbose debug logging (including XML requests/responses)."
@@ -1746,7 +1916,18 @@ def main():
     if not args.username and stored.get("username"):
         LOGGER.info(f"Using username '{username}' from state file.")
 
-    if args.configure_ha:
+    if args.configure_local_lc:
+        try:
+            configure_local_log_collector(
+                ip=ip,
+                username=username,
+                state_file=state_file_path,
+                collector_group_name=args.collector_group_name,
+            )
+        except Exception as e:
+            LOGGER.error(f"Local log collector configuration failed: {e}", exc_info=True)
+            sys.exit(1)
+    elif args.configure_ha:
         peer_ip = args.configure_ha
         if args.ha_peer_state_file:
             peer_state_file = Path(args.ha_peer_state_file).expanduser().resolve()
