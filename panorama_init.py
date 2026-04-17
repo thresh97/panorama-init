@@ -737,29 +737,21 @@ def configure_local_log_collector(
     LOGGER.info("Waiting 30s for Panorama to register ring version before commit-all...")
     time.sleep(30)
 
-    # commit-all log-collector-config must be sent as type=op — the CLI debug
-    # confirms this is how Panorama executes it. type=commit sees "no changes"
-    # because it only checks pending config diffs, not ring version propagation.
-    LOGGER.info(f"Pushing config to log collector group '{collector_group_name}'...")
-    push_cmd = (
-        f"<commit-all><log-collector-config>"
-        f"<log-collector-group>{collector_group_name}</log-collector-group>"
-        f"</log-collector-config></commit-all>"
-    )
-    LOGGER.debug(f"Commit-all LC cmd (type=op): {push_cmd}")
+    # commit-all log-collector-config is blocked at the XML API layer (HTTP 400
+    # for both type=op and type=commit). Use SSH/CLI — the same path the UI uses.
+    # api_password from state is the SSH password (set by provision_panorama).
+    LOGGER.info(f"Pushing config to log collector group '{collector_group_name}' via SSH...")
     try:
-        body = _send_op_command(ip, api_key, ctx, push_cmd, timeout=120)
-        LOGGER.debug(f"Commit-all LC Response: {body}")
-        root_r = ET.fromstring(body)
-        msg = root_r.findtext(".//line") or root_r.findtext(".//msg") or ""
-        LOGGER.info(f"  {msg.strip()}")
-        job_elem = root_r.find(".//job")
-        if job_elem is not None:
-            poll_panorama_job(ip, api_key, ctx, job_elem.text, "LC config push")
-    except RuntimeError as e:
-        # Log but don't abort — Panorama may still self-sync via ring version
-        # propagation. The poll loop below will detect success either way.
-        LOGGER.warning(f"commit-all log-collector-config failed: {e} — polling for self-sync")
+        ssh = PanoramaSSHClient(ip, username, ssh_key_path=None, password=api_password)
+        ssh.connect(max_retries=5, delay=10)
+        result = ssh.send_command(
+            f"commit-all log-collector-config log-collector-group {collector_group_name}",
+            timeout=120,
+        )
+        LOGGER.info(f"  {result.strip()}")
+        ssh.close()
+    except Exception as e:
+        LOGGER.warning(f"commit-all via SSH failed: {e} — polling for self-sync")
     _poll_lc_sync(ip, api_key, ctx, serial, collector_group_name, timeout_mins=10)
     LOGGER.info("✅ Local log collector configured and In Sync.")
 
