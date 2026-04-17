@@ -2001,18 +2001,16 @@ def main():
     if not args.username and stored.get("username"):
         LOGGER.info(f"Using username '{username}' from state file.")
 
-    if args.configure_local_lc:
-        try:
-            configure_local_log_collector(
-                ip=ip,
-                username=username,
-                state_file=state_file_path,
-                collector_group_name=args.collector_group_name,
-            )
-        except Exception as e:
-            LOGGER.error(f"Local log collector configuration failed: {e}", exc_info=True)
-            sys.exit(1)
-    elif args.configure_ha:
+    # --configure-ha is mutually exclusive with provisioning (operates on two nodes).
+    # --configure-local-lc can run standalone or sequentially after provision_panorama
+    # in the same invocation when combined with provisioning args like --serial-number.
+    _provision_args = any([
+        args.serial_number, args.otp, args.csp_api_key,
+        args.upgrade_content, args.upgrade_av, args.upgrade_panos,
+        args.plugins, args.vm_auth_key_hours is not None, args.hostname,
+    ])
+
+    if args.configure_ha:
         peer_ip = args.configure_ha
         if args.ha_peer_state_file:
             peer_state_file = Path(args.ha_peer_state_file).expanduser().resolve()
@@ -2031,26 +2029,39 @@ def main():
             LOGGER.error(f"HA configuration failed: {e}", exc_info=True)
             sys.exit(1)
     else:
-        try:
-            provision_panorama(
-                ip=ip,
-                username=username,
-                ssh_key=ssh_key_path,
-                password=panorama_password,
-                state_file=state_file_path,
-                serial_number=args.serial_number,
-                otp=args.otp,
-                csp_api_key=args.csp_api_key,
-                upgrade_content=args.upgrade_content,
-                upgrade_av=args.upgrade_av,
-                upgrade_panos=args.upgrade_panos,
-                plugins=args.plugins,
-                vm_auth_key_hours=args.vm_auth_key_hours,
-                hostname=args.hostname,
-            )
-        except Exception as e:
-            LOGGER.error(f"Provisioning failed: {e}", exc_info=True)
-            sys.exit(1)
+        if _provision_args or not args.configure_local_lc:
+            try:
+                provision_panorama(
+                    ip=ip,
+                    username=username,
+                    ssh_key=ssh_key_path,
+                    password=panorama_password,
+                    state_file=state_file_path,
+                    serial_number=args.serial_number,
+                    otp=args.otp,
+                    csp_api_key=args.csp_api_key,
+                    upgrade_content=args.upgrade_content,
+                    upgrade_av=args.upgrade_av,
+                    upgrade_panos=args.upgrade_panos,
+                    plugins=args.plugins,
+                    vm_auth_key_hours=args.vm_auth_key_hours,
+                    hostname=args.hostname,
+                )
+            except Exception as e:
+                LOGGER.error(f"Provisioning failed: {e}", exc_info=True)
+                sys.exit(1)
+
+        if args.configure_local_lc:
+            try:
+                configure_local_log_collector(
+                    ip=ip,
+                    username=username,
+                    state_file=state_file_path,
+                    collector_group_name=args.collector_group_name,
+                )
+            except Exception as e:
+                LOGGER.error(f"Local log collector configuration failed: {e}", exc_info=True)
+                sys.exit(1)
 
 
 if __name__ == "__main__":
