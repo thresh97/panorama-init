@@ -1045,7 +1045,21 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     time.sleep(15)
 
             if not command_sent:
-                raise RuntimeError("Failed to set serial number via XML API after 40 attempts.")
+                # Before giving up, check whether the serial was actually set by
+                # an attempt that sent successfully but lost the response mid-flight.
+                LOGGER.info("All attempts exhausted. Checking whether serial was set despite response errors...")
+                try:
+                    _check_raw = _send_op_command(ip, api_key, ctx, _CMD_SHOW_SYSTEM_INFO, timeout=15)
+                    _check_sn = ET.fromstring(_check_raw).findtext(".//serial")
+                    if _check_sn and _check_sn.strip() == serial_number:
+                        LOGGER.info(f"✅ Serial number '{serial_number}' is confirmed set. Continuing.")
+                        command_sent = True
+                    else:
+                        raise RuntimeError("Failed to set serial number via XML API after 40 attempts.")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    raise RuntimeError("Failed to set serial number via XML API after 40 attempts.")
 
             # Now wait for the web server to come back up and verify the serial number
             LOGGER.info("Waiting for Panorama web server to come back up and verifying serial number...")
