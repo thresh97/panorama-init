@@ -539,9 +539,11 @@ class PanoramaSSHClient:
 
     def connect(self, max_retries=15, delay=30):
         """Connects to Panorama, opens a shell, and disables the pager."""
+        _pt = logging.getLogger("paramiko.transport")
         for attempt in range(max_retries):
             try:
                 LOGGER.info(f"Attempting SSH connection to {self.ip} (Attempt {attempt + 1}/{max_retries})...")
+                _pt.setLevel(logging.CRITICAL)  # suppress socket exception noise during connect
 
                 # Attempt Key-based auth first if key file exists
                 if self.ssh_key_path and self.ssh_key_path.is_file():
@@ -575,6 +577,7 @@ class PanoramaSSHClient:
                 else:
                     raise ValueError(f"No valid SSH key found at {self.ssh_key_path} and PANORAMA_PASSWORD env var is not set.")
 
+                _pt.setLevel(logging.WARNING)  # restore after successful connect
                 LOGGER.info("✅ SSH connection successful.")
                 LOGGER.info("Opening interactive shell...")
                 self.shell = self.client.invoke_shell()
@@ -1018,11 +1021,11 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
             LOGGER.info(f"Setting Panorama serial number to '{serial_number}' via XML API...")
 
             command_sent = False
-            for attempt in range(30):
+            for attempt in range(40):
                 try:
                     # Send exactly what the user requested, without pan-os-python auto-wrapping
                     cmd_xml = f"<set><serial-number>{serial_number}</serial-number></set>"
-                    LOGGER.info(f"Sending API command (Attempt {attempt+1}/30)...")
+                    LOGGER.info(f"Sending API command (Attempt {attempt+1}/40)...")
 
                     _send_op_command(ip, api_key, ctx, cmd_xml, timeout=15)
                     command_sent = True
@@ -1042,7 +1045,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     time.sleep(15)
 
             if not command_sent:
-                raise RuntimeError("Failed to set serial number via XML API after 30 attempts.")
+                raise RuntimeError("Failed to set serial number via XML API after 40 attempts.")
 
             # Now wait for the web server to come back up and verify the serial number
             LOGGER.info("Waiting for Panorama web server to come back up and verifying serial number...")
