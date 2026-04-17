@@ -757,6 +757,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                        vm_auth_key_hours: int = None, hostname: str = None):
     """Executes the idempotent provisioning sequence on Panorama."""
     state = load_state(state_file)
+    _commit_just_ran = False  # local flag, never persisted to state file
 
     # Persist IP and username immediately so they can be recovered from the state file on re-runs.
     changed = False
@@ -918,7 +919,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     if "committed successfully" in commit_output.lower():
                         LOGGER.info("✅ Initial commit successful.")
                         state["initial_commit_done"] = True
-                        state["_commit_just_ran"] = True
+                        _commit_just_ran = True
                         save_state(state_file, state)
                     else:
                         LOGGER.error(f"Commit may have failed. Output:\n{commit_output}")
@@ -936,7 +937,7 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
     # The initial commit restarts Panorama's management plane, which briefly
     # takes the network interface down. Wait before the first API attempt so
     # we don't burn all retries against a temporarily unreachable host.
-    if state.pop("_commit_just_ran", False):
+    if _commit_just_ran:
         LOGGER.info("Waiting 60s for Panorama management plane to restart after commit...")
         time.sleep(60)
 
