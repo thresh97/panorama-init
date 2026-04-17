@@ -84,6 +84,21 @@ logging.getLogger("paramiko").setLevel(logging.WARNING)
 # Fix #1: Use <system> not <s> throughout.
 _CMD_SHOW_SYSTEM_INFO = "<show><system><info/></system></show>"
 
+import ipaddress as _ipaddress
+
+def _is_rfc1918(ip_str: str) -> bool:
+    """Return True if ip_str is a private (RFC1918) address."""
+    try:
+        addr = _ipaddress.ip_address(ip_str)
+        return any(addr in net for net in (
+            _ipaddress.ip_network('10.0.0.0/8'),
+            _ipaddress.ip_network('172.16.0.0/12'),
+            _ipaddress.ip_network('192.168.0.0/16'),
+        ))
+    except ValueError:
+        return False
+
+
 # Connection drop signatures that indicate an intentional server restart,
 # not a true failure. Defined once and reused across all retry loops.
 # Fix #12: Centralise this constant instead of redefining it in each step.
@@ -1151,17 +1166,30 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                 LOGGER.info("⏭️  Skipping hostname configuration (already complete).")
 
             # Step 3b: Set public management IP (optional)
-            if public_ip:
-                if state.get("public_ip_set") and state.get("public_ip") == public_ip:
-                    LOGGER.info(f"⏭️  Public IP '{public_ip}' already configured. Skipping.")
+            # Resolve --public-ip: '_auto_' means use the connecting IP.
+            _resolved_public_ip = None
+            if public_ip == "_auto_":
+                if _is_rfc1918(ip):
+                    LOGGER.warning(
+                        f"--public-ip with no value requires a non-RFC1918 connecting IP "
+                        f"({ip} is private). Pass --public-ip <public-ip> explicitly."
+                    )
                 else:
-                    LOGGER.info(f"Setting public-ip-address to '{public_ip}'...")
+                    _resolved_public_ip = ip
+                    LOGGER.info(f"--public-ip: using connecting IP {ip} as public-ip-address.")
+            elif public_ip:
+                _resolved_public_ip = public_ip
+
+            if _resolved_public_ip:
+                if state.get("public_ip_set") and state.get("public_ip") == _resolved_public_ip:
+                    LOGGER.info(f"⏭️  Public IP '{_resolved_public_ip}' already configured. Skipping.")
+                else:
                     ssh.send_command(
-                        f"set deviceconfig system public-ip-address {public_ip}",
+                        f"set deviceconfig system public-ip-address {_resolved_public_ip}",
                         prompt_chars=['#'],
                     )
                     state["public_ip_set"] = True
-                    state["public_ip"] = public_ip
+                    state["public_ip"] = _resolved_public_ip
                     save_state(state_file, state)
                     LOGGER.info("✅ Public IP configured.")
 
@@ -1863,13 +1891,17 @@ def main():
     )
     parser.add_argument(
         "--public-ip",
-        metavar="IP",
+        nargs="?",
+        const="_auto_",
         default=None,
+        metavar="IP",
         help=(
-            "Set the public management IP address on Panorama "
-            "(deviceconfig system public-ip-address). Only applied when the "
-            "value differs from what is already configured. Warns if the value "
-            "matches the management IP used to connect."
+            "Set deviceconfig system public-ip-address so managed firewalls can "
+            "bootstrap to Panorama via a public/NAT address.\n"
+            "  --public-ip          Use the connecting IP automatically "
+            "(only valid when it is non-RFC1918).\n"
+            "  --public-ip 1.2.3.4  Use the specified IP (required when "
+            "connecting via a jump host or private IP)."
         )
     )
     parser.add_argument(
