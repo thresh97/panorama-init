@@ -94,6 +94,8 @@ _EXPECTED_DISCONNECT_ERRORS = [
     "timed out",
     "remote end closed connection",
     "connection refused",
+    "network is down",   # errno 50 — Panorama drops connection immediately after serial set
+    "errno 50",
 ]
 
 
