@@ -525,6 +525,40 @@ def configure_panorama_ha(
     LOGGER.info("✅ HA pair healthy.")
 
 
+def _poll_lc_sync(ip: str, api_key: str, ctx, serial: str,
+                  group_name: str, timeout_mins: int = 5):
+    """
+    Poll until the log collector reports Connected=yes and Config Status=In Sync.
+    Raises RuntimeError on timeout or if status is not reached.
+    """
+    cmd = f"<show><log-collector-group><name>{group_name}</name></log-collector-group></show>"
+    max_attempts = timeout_mins * 4  # 15s intervals
+    LOGGER.info(f"Polling LC sync status for {serial} in group '{group_name}'...")
+    for attempt in range(max_attempts):
+        time.sleep(15)
+        try:
+            raw = _send_op_command(ip, api_key, ctx, cmd, timeout=15)
+            text = "".join(ET.fromstring(raw).itertext())
+            for line in text.splitlines():
+                if serial in line:
+                    connected = "yes" in line.lower()
+                    in_sync   = "in sync" in line.lower()
+                    LOGGER.info(
+                        f"  LC {serial}: connected={connected} "
+                        f"config_status={'In Sync' if in_sync else 'Out of Sync'} "
+                        f"(attempt {attempt + 1}/{max_attempts})"
+                    )
+                    if connected and in_sync:
+                        return
+                    break
+        except Exception as exc:
+            LOGGER.debug(f"  LC sync poll error: {exc}")
+    raise RuntimeError(
+        f"Log collector {serial} in group '{group_name}' did not reach "
+        f"'Connected / In Sync' within {timeout_mins} minutes."
+    )
+
+
 def configure_local_log_collector(
     ip: str,
     username: str,
@@ -710,7 +744,8 @@ def configure_local_log_collector(
         err = e.read().decode('utf-8')
         LOGGER.debug(f"Commit-all LC HTTP Error: {err}")
         raise RuntimeError(f"Commit-all LC failed HTTP {e.code}: {err}")
-    LOGGER.info("✅ Local log collector configured and active.")
+    _poll_lc_sync(ip, api_key, ctx, serial, collector_group_name)
+    LOGGER.info("✅ Local log collector configured and In Sync.")
 
 
 # --- SSH Interaction Class ---
