@@ -1604,6 +1604,12 @@ def provision_panorama(ip: str, username: str, ssh_key: Path, password: str, sta
                     # Sub-step 1: Download the target image.
                     # PAN-OS images are ~1 GB; allow 30 mins for the download job.
                     if not state.get("panos_upgrade_downloaded"):
+                        LOGGER.info(f"Refreshing software update list before download...")
+                        _send_op_command(
+                            ip, api_key, ctx,
+                            "<request><system><software><check/></software></system></request>",
+                            timeout=60
+                        )
                         LOGGER.info(f"1/4 Downloading PAN-OS {target_version}...")
                         # Fix #4: Use correct <system> XML tag for download command.
                         dl_cmd = (
